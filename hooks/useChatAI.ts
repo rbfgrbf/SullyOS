@@ -28,6 +28,14 @@ import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, buildMcpTextFal
 import { buildToolResultMessage, normalizeToolCallsForCompat } from '../utils/toolCallCompat';
 import { buildChatRequestPayload } from '../utils/chatRequestPayload';
 import {
+    approveOmbreQueueItem,
+    enqueueOmbreMemoryPlan,
+    rejectOmbreQueueItem,
+    updateOmbreQueueItemDraft,
+    type OmbreConfirmedWriteQueueItem,
+} from '../utils/ombre/ombreConfirmedWriteQueue';
+import type { OmbreMemoryPlan } from '../utils/ombre/ombreTypes';
+import {
     isInstantConfigReady,
     sendInstantPushAndAwaitReply,
     formatDiagnostics,
@@ -484,6 +492,7 @@ export const useChatAI = ({
     const [lastTokenUsage, setLastTokenUsage] = useState<number | null>(null);
     const [tokenBreakdown, setTokenBreakdown] = useState<{ prompt: number; completion: number; total: number; msgCount: number; pass: string } | null>(null);
     const [lastSystemPrompt, setLastSystemPrompt] = useState<string>('');
+    const [ombreMemoryReviewItem, setOmbreMemoryReviewItem] = useState<OmbreConfirmedWriteQueueItem | null>(null);
 
     // 意识流：由副 API 的情绪评估同轮产出（innerState 字段）
     // 下一轮 system prompt 会把它作为角色的内心状态注入
@@ -495,7 +504,32 @@ export const useChatAI = ({
     // 切换角色时重置
     useEffect(() => {
         setEvolvedNarrative('');
+        setOmbreMemoryReviewItem(null);
     }, [char?.id]);
+
+    const queueOmbreMemoryReviewCandidate = (memoryPlan: OmbreMemoryPlan | undefined): void => {
+        if (!memoryPlan) return;
+        try {
+            const item = enqueueOmbreMemoryPlan(memoryPlan);
+            if (item) setOmbreMemoryReviewItem(item);
+        } catch {
+            console.warn('[ombre-memory-review] failed to queue dry-run candidate');
+        }
+    };
+
+    const approveOmbreMemoryReview = (): void => {
+        setOmbreMemoryReviewItem(item => item ? approveOmbreQueueItem(item) : item);
+    };
+
+    const rejectOmbreMemoryReview = (): void => {
+        setOmbreMemoryReviewItem(item => item ? rejectOmbreQueueItem(item) : item);
+    };
+
+    const editOmbreMemoryReviewDraft = (content: string): void => {
+        setOmbreMemoryReviewItem(item => item && item.status === 'pending'
+            ? updateOmbreQueueItemDraft(item, content)
+            : item);
+    };
 
     // ─── Post-push emotion eval (Option B: online/offline split) ───────────────
     //
@@ -801,6 +835,7 @@ export const useChatAI = ({
             const cleanedApiMessages = payload.cleanedApiMessages;
             const fullMessages = payload.fullMessages;
             const promptBuildSkipped = payload.flags.promptBuildSkipped;
+            queueOmbreMemoryReviewCandidate(payload.ombreMemoryPlan);
             if (payload.flags.mcdActive) {
                 console.log(`🍔 [MCD-MiniApp] 注入协同点餐上下文 step=${mcdMiniSnap?.step} cartItems=${mcdMiniSnap?.cart?.length || 0} menuItems=${mcdMiniSnap?.menuMeals ? Object.keys(mcdMiniSnap.menuMeals).length : 0} nutrition=${mcdMiniSnap?.nutritionData ? mcdMiniSnap.nutritionData.length : 0}字`);
             }
@@ -1757,5 +1792,10 @@ export const useChatAI = ({
         isProactiveActive,
         lastSystemPrompt,
         evolvedNarrative,
+        ombreMemoryReviewItem,
+        ombreMemoryReviewPreview: ombreMemoryReviewItem?.confirmedPreview ?? null,
+        approveOmbreMemoryReview,
+        rejectOmbreMemoryReview,
+        editOmbreMemoryReviewDraft,
     };
 };

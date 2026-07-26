@@ -323,9 +323,9 @@ ${OBSERVE_CLOSE}`;
 });
 
 describe('DatePrompts.buildPeekPayload', () => {
-    it('描写风格短语跟随风格预设；extra 追加进指令', () => {
+    it('描写风格短语跟随风格预设；extra 追加进指令', async () => {
         const char = makeChar({ dateStyleConfig: { style: 'plain', extra: '环境描写多一点。' } });
-        const { messages } = DatePrompts.buildPeekPayload({
+        const { messages } = await DatePrompts.buildPeekPayload({
             char, userProfile: user, allMsgs: [makeMsg()], emojis: [],
         });
         const userMsg = messages[messages.length - 1].content as string;
@@ -335,13 +335,13 @@ describe('DatePrompts.buildPeekPayload', () => {
         expect(userMsg).toContain('第三人称');
     });
 
-    it('历史里的卡片消息被压成摘要，原始 HTML/JSON 不进 prompt', () => {
+    it('历史里的卡片消息被压成摘要，原始 HTML/JSON 不进 prompt', async () => {
         const rawHtml = '<div style="color:red">巨大的原始HTML</div>';
         const msgs = [
             makeMsg({ type: 'html_card' as any, role: 'assistant', content: `[HTML卡片] ${rawHtml}`, metadata: { htmlTextPreview: '一张卡片' } }),
             makeMsg({ content: '看到了' }),
         ];
-        const { messages } = DatePrompts.buildPeekPayload({
+        const { messages } = await DatePrompts.buildPeekPayload({
             char: makeChar(), userProfile: user, allMsgs: msgs, emojis: [],
         });
         const userMsg = messages[messages.length - 1].content as string;

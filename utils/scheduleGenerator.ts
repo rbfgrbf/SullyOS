@@ -1,9 +1,10 @@
 
 import { CharacterProfile, UserProfile, DailySchedule, ScheduleSlot, Message } from '../types';
-import { ContextBuilder } from './context';
 import { DB } from './db';
 import { safeResponseJson, extractContent, extractJson } from './safeApi';
 import { injectMemoryPalace } from './memoryPalace/pipeline';
+import { resolveOmbreProviderConfig } from './ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from './ombre/featurePrompt';
 import { getLocalDateKey } from './localDate';
 import { getLocalDailySchedule } from './dailySchedule';
 
@@ -274,16 +275,26 @@ export async function generateDailyScheduleForChar(
     // hideBeforeMessageId 与 chat 端 ChatPrompts.buildMessageHistory 同款过滤
     const filteredMessages = recentMessages.filter(m => !char.hideBeforeMessageId || m.id >= char.hideBeforeMessageId);
 
-    // 记忆宫殿：与 useChatAI.ts:573 相同的调用形态，结果会挂到 char.memoryPalaceInjection 上，
-    // 由下面的 buildCoreContext 自动读取注入。
-    try {
-        await injectMemoryPalace(char as any, filteredMessages, undefined, userProfile?.name);
-    } catch (e) {
-        console.warn('[Schedule] memory palace inject failed (non-fatal):', e);
+    const ombreEnabled = resolveOmbreProviderConfig(char as any, userProfile as any).enabled;
+    if (!ombreEnabled) {
+        // 记忆宫殿：与 useChatAI.ts:573 相同的调用形态，结果会挂到 char.memoryPalaceInjection 上，
+        // 由下面的 Provider legacy fallback 自动读取注入。
+        try {
+            await injectMemoryPalace(char as any, filteredMessages, undefined, userProfile?.name);
+        } catch (e) {
+            console.warn('[Schedule] memory palace inject failed (non-fatal):', e);
+        }
     }
 
     // chat 主链路传 true（含详细记忆）；日程之前传的是 false，统一改成 true。
-    const baseContext = ContextBuilder.buildCoreContext(char, userProfile, true);
+    const baseContext = (await buildOmbreFeatureSystemPrompt({
+        char,
+        userProfile,
+        feature: 'schedule',
+        recentMsgsHint: filteredMessages,
+        includeDetailedMemories: true,
+        recallQueryHint: `${char.name} ${today} schedule`,
+    })).systemPrompt;
 
     const chatHistoryBlock = formatChatHistoryForSchedule(filteredMessages, char, userProfile);
 

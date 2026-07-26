@@ -19,11 +19,12 @@
  */
 
 import { CharacterProfile, UserProfile, Message, Emoji, DateStyleConfig, DateObservation, DateObserveConfig, DateObserveCustomField } from '../types';
-import { ContextBuilder } from './context';
 import { ChatPrompts } from './chatPrompts';
 import { injectMemoryPalace } from './memoryPalace/pipeline';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
 import { getVoicePromptOverride } from './ttsProvider';
+import { resolveOmbreProviderConfig } from './ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from './ombre/featurePrompt';
 
 export type ApiMessage = { role: string; content: any };
 
@@ -631,12 +632,12 @@ export const DatePrompts = {
      * 历史以纯文本块塞进 user 消息（保持"你不在和用户对话"的框定），
      * 但文本本身来自 buildMessageHistory，卡片/媒体已压成短摘要。
      */
-    buildPeekPayload: (input: {
+    buildPeekPayload: async (input: {
         char: CharacterProfile;
         userProfile: UserProfile;
         allMsgs: Message[];
         emojis: Emoji[];
-    }): { messages: ApiMessage[] } => {
+    }): Promise<{ messages: ApiMessage[] }> => {
         const { char, userProfile, allMsgs, emojis } = input;
         const charTz = resolveCharTimeZone(char);
         const dateTimeOn = isDateTimeAwarenessOn(char);
@@ -652,7 +653,15 @@ export const DatePrompts = {
         const recentMsgs = flattenHistoryToText(apiMessages);
 
         // 线下时间感知关掉 → 抑制 buildCoreContext 的时间注入，让见面真正脱离现实时间线（纯架空）
-        const baseContext = ContextBuilder.buildCoreContext(char, userProfile, false, undefined, undefined, { skipTimeAwareness: !isDateTimeAwarenessOn(char) });
+        const baseContext = await buildOmbreFeatureSystemPrompt({
+            char,
+            userProfile,
+            feature: 'date',
+            emojis,
+            recentMsgsHint: allMsgs.slice(-peekLimit),
+            includeDetailedMemories: false,
+            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char) },
+        });
 
         // 文风预设也作用于开场感知；人称（pov）刻意不作用——peek 的设计就是
         // 第三人称旁观镜头（用户还没"走过去"），人称指令只影响 session 内叙述
@@ -681,7 +690,7 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
 
         return {
             messages: [
-                { role: 'system', content: baseContext },
+                { role: 'system', content: baseContext.systemPrompt },
                 { role: 'user', content: `[最近记录 (Previous Context)]:${recentMsgs}${contextSeparator}${peekInstructions}\n\n(Start sensing...)` },
             ],
         };
@@ -704,10 +713,20 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
 
         const historyMsgs = buildDateHistory(allMsgs, char, userProfile, emojis);
 
-        // 向量召回挂到 char.memoryPalaceInjection，buildCoreContext 会读取
-        await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name);
-        const systemPrompt = ContextBuilder.buildCoreContext(char, userProfile, true, undefined, undefined, { skipTimeAwareness: !isDateTimeAwarenessOn(char) })
-            + buildVNModeBlock(char, userProfile?.name || '');
+        const ombreEnabled = resolveOmbreProviderConfig(char as any, userProfile as any).enabled;
+        if (!ombreEnabled) {
+            await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name);
+        }
+        const basePrompt = await buildOmbreFeatureSystemPrompt({
+            char,
+            userProfile,
+            feature: 'date',
+            emojis,
+            recentMsgsHint: allMsgs.slice(-(char.contextLimit || 500)),
+            includeDetailedMemories: true,
+            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char) },
+        });
+        const systemPrompt = basePrompt.systemPrompt + buildVNModeBlock(char, userProfile?.name || '');
 
         // 每轮轮换的聚焦线索：把注意力推向不同的具体方向，相邻回复天然有差异
         const focusLine = isDigDeeperOn(char.dateStyleConfig) ? ` 本轮线索：${pickFocusHint()}。` : '';

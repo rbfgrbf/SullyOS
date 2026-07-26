@@ -27,6 +27,7 @@ import { isPushVapidReady } from '../utils/pushVapid';
 import ApiCallLogModal from '../components/settings/ApiCallLogModal';
 import { DB } from '../utils/db';
 import { getBackupReminderState, setBackupReminderIntervalDays, daysSinceLastBackup, BACKUP_REMINDER_MIN_DAYS, BACKUP_REMINDER_MAX_DAYS } from '../utils/backupReminder';
+import { loadOmbreGlobalConfig, saveOmbreGlobalConfig } from '../utils/ombre/ombreGlobalConfig';
 
 // hot_news（orz.ai）可选热榜平台。key 必须与 API 的 ?platform= 完全一致。
 const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
@@ -55,6 +56,22 @@ const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
 // 「主动消息 Push 加速」面板入口开关。底层逻辑（心跳、订阅、诊断）全部保留，
 // 这里设为 false 只是把设置页里的入口隐藏掉，想恢复改回 true 即可。
 const SHOW_PROACTIVE_PUSH_ACCEL_UI = false;
+
+const OMBRE_RECALL_OPTIONS = ['off', 'breath', 'search', 'advanced'] as const;
+const OMBRE_WRITE_OPTIONS = ['off', 'dry-run'] as const;
+
+const asOmbreRecallOption = (value: unknown): typeof OMBRE_RECALL_OPTIONS[number] => (
+    OMBRE_RECALL_OPTIONS.includes(value as any) ? value as typeof OMBRE_RECALL_OPTIONS[number] : 'off'
+);
+
+const asOmbreWriteOption = (value: unknown): typeof OMBRE_WRITE_OPTIONS[number] => (
+    OMBRE_WRITE_OPTIONS.includes(value as any) ? value as typeof OMBRE_WRITE_OPTIONS[number] : 'off'
+);
+
+const positiveNumberOr = (value: unknown, fallback: number): number => {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+};
 
 const DiagRow: React.FC<{ label: string; value: string; bad?: boolean }> = ({ label, value, bad }) => (
     <div className="flex items-start justify-between gap-3">
@@ -376,6 +393,18 @@ const Settings: React.FC = () => {
   const [localVoicePromptFish, setLocalVoicePromptFish] = useState(apiConfig.voicePrompts?.fishaudio || '');
   const [localVoicePromptDate, setLocalVoicePromptDate] = useState(apiConfig.voicePrompts?.dateVoice || '');
   const [showVoicePrompts, setShowVoicePrompts] = useState(false);
+  const initialOmbreConfig = useMemo(() => loadOmbreGlobalConfig(), []);
+  const [ombreEnabled, setOmbreEnabled] = useState(initialOmbreConfig.enabled === true);
+  const [ombreCorePrompt, setOmbreCorePrompt] = useState(initialOmbreConfig.corePrompt || '');
+  const [ombreMcpEndpoint, setOmbreMcpEndpoint] = useState(initialOmbreConfig.mcpEndpoint || '');
+  const [ombreProxyEndpoint, setOmbreProxyEndpoint] = useState(initialOmbreConfig.proxyEndpoint || '');
+  const [ombreRecallMode, setOmbreRecallMode] = useState(asOmbreRecallOption(initialOmbreConfig.memoryRecallMode));
+  const [ombreWriteMode, setOmbreWriteMode] = useState(asOmbreWriteOption(initialOmbreConfig.memoryWriteMode));
+  const [ombreMaxResults, setOmbreMaxResults] = useState(positiveNumberOr(initialOmbreConfig.maxResults, 3));
+  const [ombreMaxMemoryChars, setOmbreMaxMemoryChars] = useState(positiveNumberOr(initialOmbreConfig.maxMemoryChars, 1200));
+  const [ombreStrictNoTouch, setOmbreStrictNoTouch] = useState(initialOmbreConfig.strictNoTouch === true);
+  const [showOmbreAdvanced, setShowOmbreAdvanced] = useState(false);
+  const [ombreStatusMsg, setOmbreStatusMsg] = useState('');
   const [showAceStepGuide, setShowAceStepGuide] = useState(false);
   const [otherStatusMsg, setOtherStatusMsg] = useState('');
   // 高级设置（流式/温度）默认折叠 — 大多数用户不需要碰
@@ -742,6 +771,38 @@ const Settings: React.FC = () => {
   // 选「谁来做语音生成」立即落库——不需要再点下面的保存。
   // 连同当前「其他 API」草稿一起提交（与保存按钮同一份 payload）：一是即时生效，
   // 二是避免 [apiConfig] 同步 effect 把刚填、还没保存的 Key 草稿冲掉。
+  const handleSaveOmbreProvider = () => {
+    if (ombreEnabled && !ombreCorePrompt.trim()) {
+      setOmbreStatusMsg('Core prompt required');
+      addToast('Ombre core prompt is empty', 'error');
+      setTimeout(() => setOmbreStatusMsg(''), 2500);
+      return;
+    }
+
+    const saved = saveOmbreGlobalConfig({
+      enabled: ombreEnabled,
+      corePrompt: ombreCorePrompt,
+      mcpEndpoint: ombreMcpEndpoint,
+      proxyEndpoint: ombreProxyEndpoint,
+      memoryRecallMode: ombreRecallMode,
+      memoryWriteMode: ombreWriteMode,
+      maxResults: ombreMaxResults,
+      maxMemoryChars: ombreMaxMemoryChars,
+      strictNoTouch: ombreStrictNoTouch,
+    });
+    setOmbreEnabled(saved.enabled === true);
+    setOmbreCorePrompt(saved.corePrompt || '');
+    setOmbreMcpEndpoint(saved.mcpEndpoint || '');
+    setOmbreProxyEndpoint(saved.proxyEndpoint || '');
+    setOmbreRecallMode(asOmbreRecallOption(saved.memoryRecallMode));
+    setOmbreWriteMode(asOmbreWriteOption(saved.memoryWriteMode));
+    setOmbreMaxResults(positiveNumberOr(saved.maxResults, 3));
+    setOmbreMaxMemoryChars(positiveNumberOr(saved.maxMemoryChars, 1200));
+    setOmbreStrictNoTouch(saved.strictNoTouch === true);
+    setOmbreStatusMsg('Saved');
+    setTimeout(() => setOmbreStatusMsg(''), 2000);
+  };
+
   const selectTtsProvider = (provider: 'minimax' | 'fishaudio') => {
     setLocalTtsProvider(provider);
     updateApiConfig({
@@ -1679,6 +1740,101 @@ const Settings: React.FC = () => {
         </SettingsSection>
 
         {/* API 调用记录入口 — 点开看最近 5 天各 App / 角色 / 用途的调用明细 */}
+        <SettingsSection
+            title="Ombre Provider"
+            icon={
+                <div className="p-2 bg-violet-100/50 rounded-xl text-violet-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z" />
+                    </svg>
+                </div>
+            }
+            badge={<span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${ombreEnabled ? 'bg-violet-100 text-violet-600' : 'bg-slate-100 text-slate-400'}`}>{ombreEnabled ? 'ON' : 'OFF'}</span>}
+        >
+            <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                        <div className="text-sm font-semibold text-slate-600">Use Ombre prompt provider</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">New characters use this unless a character explicitly disables it.</div>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => setOmbreEnabled(v => !v)}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors shrink-0 ${ombreEnabled ? 'bg-violet-500' : 'bg-slate-200'}`}
+                    >
+                        <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${ombreEnabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                    </button>
+                </div>
+
+                <div className="group">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Ombre Core Prompt</label>
+                    <textarea
+                        value={ombreCorePrompt}
+                        onChange={(e) => setOmbreCorePrompt(e.target.value)}
+                        rows={6}
+                        placeholder="Paste the canonical Ombre/Xiaoguai core prompt here."
+                        className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-4 py-3 text-xs font-mono leading-relaxed focus:bg-white transition-all resize-y min-h-[132px]"
+                    />
+                </div>
+
+                <button
+                    type="button"
+                    onClick={() => setShowOmbreAdvanced(v => !v)}
+                    className="text-[10px] text-slate-400 hover:text-slate-500 transition-colors flex items-center gap-1 pl-1 active:scale-95"
+                >
+                    <span>Advanced memory settings</span>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className={`w-2.5 h-2.5 transition-transform ${showOmbreAdvanced ? 'rotate-180' : ''}`}>
+                        <path fillRule="evenodd" d="M5.22 8.22a.75.75 0 0 1 1.06 0L10 11.94l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 9.28a.75.75 0 0 1 0-1.06Z" clipRule="evenodd" />
+                    </svg>
+                </button>
+
+                {showOmbreAdvanced && (
+                    <div className="pl-2 border-l-2 border-violet-100 space-y-3 py-1">
+                        <div className="group">
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">MCP Endpoint</label>
+                            <input type="text" value={ombreMcpEndpoint} onChange={(e) => setOmbreMcpEndpoint(e.target.value)} placeholder="http://localhost:18080/mcp" className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-4 py-2.5 text-xs font-mono focus:bg-white transition-all" />
+                        </div>
+                        <div className="group">
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Proxy Endpoint</label>
+                            <input type="text" value={ombreProxyEndpoint} onChange={(e) => setOmbreProxyEndpoint(e.target.value)} placeholder="http://localhost:18081/ombre" className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-4 py-2.5 text-xs font-mono focus:bg-white transition-all" />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <div>
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Recall</label>
+                                <select value={ombreRecallMode} onChange={(e) => setOmbreRecallMode(asOmbreRecallOption(e.target.value))} className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-3 py-2.5 text-xs text-slate-600 focus:bg-white transition-all">
+                                    {OMBRE_RECALL_OPTIONS.map(option => <option key={option} value={option}>{option}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Write</label>
+                                <select value={ombreWriteMode} onChange={(e) => setOmbreWriteMode(asOmbreWriteOption(e.target.value))} className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-3 py-2.5 text-xs text-slate-600 focus:bg-white transition-all">
+                                    {OMBRE_WRITE_OPTIONS.map(option => <option key={option} value={option}>{option}</option>)}
+                                </select>
+                            </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <div>
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Max Results</label>
+                                <input type="number" min={1} max={8} value={ombreMaxResults} onChange={(e) => setOmbreMaxResults(positiveNumberOr(e.target.value, 3))} className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-3 py-2.5 text-xs font-mono focus:bg-white transition-all" />
+                            </div>
+                            <div>
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">Max Memory Chars</label>
+                                <input type="number" min={100} max={6000} value={ombreMaxMemoryChars} onChange={(e) => setOmbreMaxMemoryChars(positiveNumberOr(e.target.value, 1200))} className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-3 py-2.5 text-xs font-mono focus:bg-white transition-all" />
+                            </div>
+                        </div>
+                        <label className="flex items-center justify-between gap-3 text-xs text-slate-500 bg-white/40 border border-slate-100 rounded-xl px-3 py-2.5">
+                            <span>Strict no-touch recall</span>
+                            <input type="checkbox" checked={ombreStrictNoTouch} onChange={(e) => setOmbreStrictNoTouch(e.target.checked)} className="accent-violet-500" />
+                        </label>
+                    </div>
+                )}
+
+                <button onClick={handleSaveOmbreProvider} className="w-full py-3 rounded-2xl font-bold text-white shadow-lg shadow-violet-500/15 bg-violet-500 active:scale-95 transition-all">
+                    {ombreStatusMsg || 'Save Ombre Provider'}
+                </button>
+            </div>
+        </SettingsSection>
+
         <button
             type="button"
             onClick={() => setShowApiCallLog(true)}

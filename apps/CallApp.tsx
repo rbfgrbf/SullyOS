@@ -10,12 +10,13 @@ import { normalizeVoiceTags } from '../utils/sanitize';
 import { FISH_VOICE_ACTING_GUIDE, synthesizeSpeechFishDetailed, resolveFishAudioApiKey, cleanTextForTtsFish, stripFishMarkupForDisplay } from '../utils/fishAudioTts';
 import { resolveTtsProvider, getTtsProvider, getVoicePromptOverride } from '../utils/ttsProvider';
 import { startStt, isSttSupported, type SttSession } from '../utils/speechToText';
-import { ContextBuilder } from '../utils/context';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
+import { resolveOmbreProviderConfig } from '../utils/ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from '../utils/ombre/featurePrompt';
 import { RealtimeContextManager } from '../utils/realtimeContext';
 import { DB } from '../utils/db';
 import { ChatPrompts } from '../utils/chatPrompts';
-import { Message, ChatTheme, AppID } from '../types';
+import { CharacterProfile, Message, ChatTheme, AppID, UserProfile } from '../types';
 import { PRESET_THEMES } from '../components/chat/ChatConstants';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 type CallState = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'ended' | 'error';
@@ -285,6 +286,29 @@ ${getVoicePromptOverride(getTtsProvider()) ?? (getTtsProvider() === 'fishaudio' 
 - 中文部分和 <语音> 部分表达的意思要一致` : '';
   return [coreContext, timeContext, callPrompt, voiceLangPrompt].filter(Boolean).join('\n\n');
 };
+
+export async function buildCallSystemPrompt(input: {
+  char?: CharacterProfile;
+  userProfile: UserProfile;
+  recentMsgsHint?: Message[];
+  voiceLang?: string;
+}): Promise<string> {
+  const userName = input.userProfile?.name?.trim() || '用户';
+  if (!input.char) {
+    return buildCallPrompt(userName, undefined, undefined, input.voiceLang);
+  }
+
+  const basePrompt = await buildOmbreFeatureSystemPrompt({
+    char: input.char,
+    userProfile: input.userProfile,
+    feature: 'call',
+    recentMsgsHint: input.recentMsgsHint || [],
+    includeDetailedMemories: true,
+  });
+
+  return buildCallPrompt(userName, input.char.name, basePrompt.systemPrompt, input.voiceLang);
+}
+
 const CallApp: React.FC = () => {
   const { closeApp, openApp, characters, activeCharacterId, addToast, apiConfig, userProfile, customThemes, suspendCall, suspendedCall, clearSuspendedCall, updateCharacter, characterGroups } = useOS();
 
@@ -717,14 +741,20 @@ const CallApp: React.FC = () => {
   const requestAssistantReply = async (input: string, skipDbId?: number): Promise<string> => {
     const baseUrl = apiConfig.baseUrl?.replace(/\/+$/, '');
     if (!baseUrl) throw new Error('请先在设置里配置聊天 API URL');
-    const userName = userProfile?.name?.trim() || '用户';
+    let callMsgs: Message[] = [];
     if (selectedChar) {
-      const callMsgs = await DB.getMessagesByCharId(selectedChar.id);
-      await injectMemoryPalace(selectedChar, callMsgs);
+      callMsgs = await DB.getMessagesByCharId(selectedChar.id);
+      const ombreEnabled = resolveOmbreProviderConfig(selectedChar as any, userProfile as any).enabled;
+      if (!ombreEnabled) {
+        await injectMemoryPalace(selectedChar, callMsgs);
+      }
     }
-    const systemPrompt = selectedChar
-      ? buildCallPrompt(userName, selectedChar.name, ContextBuilder.buildCoreContext(selectedChar, userProfile, true), voiceLang || undefined)
-      : buildCallPrompt(userName, undefined, undefined, voiceLang || undefined);
+    const systemPrompt = await buildCallSystemPrompt({
+      char: selectedChar,
+      userProfile,
+      recentMsgsHint: callMsgs,
+      voiceLang: voiceLang || undefined,
+    });
     const messages = await buildHistoryMessages(input, skipDbId);
     const chatData = await safeFetchJson(`${baseUrl}/chat/completions`, {
       method: 'POST',

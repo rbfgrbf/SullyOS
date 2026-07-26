@@ -6,9 +6,10 @@ import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { Task, Anniversary, CharacterProfile } from '../types';
 import Modal from '../components/os/Modal';
-import { ContextBuilder } from '../utils/context';
 import { safeResponseJson } from '../utils/safeApi';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
+import { resolveOmbreProviderConfig } from '../utils/ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from '../utils/ombre/featurePrompt';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import { getCalendarDayDifference, getLocalDateKey } from '../utils/localDate';
 import { useLocalDateKey } from '../hooks/useLocalDateKey';
@@ -142,8 +143,18 @@ const ScheduleApp: React.FC = () => {
         try {
             // 1. Build Persona Context
             // RESTORED: Full context
-            await injectMemoryPalace(supervisor, undefined, task.title);
-            const baseContext = ContextBuilder.buildCoreContext(supervisor, userProfile);
+            const ombreEnabled = resolveOmbreProviderConfig(supervisor as any, userProfile as any).enabled;
+            if (!ombreEnabled) {
+                await injectMemoryPalace(supervisor, undefined, task.title);
+            }
+            const baseContext = (await buildOmbreFeatureSystemPrompt({
+                char: supervisor,
+                userProfile,
+                feature: 'schedule',
+                recentMsgsHint: [],
+                includeDetailedMemories: true,
+                recallQueryHint: task.title,
+            })).systemPrompt;
 
             const userPrompt = `
 ### 场景：任务完成 (Task Completed)
@@ -232,8 +243,18 @@ const ScheduleApp: React.FC = () => {
         const dayText = daysDiff > 0 ? `还有 ${daysDiff} 天` : (daysDiff === 0 ? '就是今天!' : `已经过去 ${Math.abs(daysDiff)} 天了`);
 
         // RESTORED: Full context
-        await injectMemoryPalace(char, undefined, anni.title);
-        const baseContext = ContextBuilder.buildCoreContext(char, userProfile);
+        const ombreEnabled = resolveOmbreProviderConfig(char as any, userProfile as any).enabled;
+        if (!ombreEnabled) {
+            await injectMemoryPalace(char, undefined, anni.title);
+        }
+        const baseContext = (await buildOmbreFeatureSystemPrompt({
+            char,
+            userProfile,
+            feature: 'schedule',
+            recentMsgsHint: [],
+            includeDetailedMemories: true,
+            recallQueryHint: anni.title,
+        })).systemPrompt;
 
         const userPrompt = `
 ### 场景：纪念日提醒

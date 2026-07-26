@@ -28,6 +28,9 @@ import { isPromptBuildSkipped, isSystemMessageMergeEnabled } from './devDebug';
 import { mergeSystemMessages } from './systemMessageMerge';
 import { injectWorldbookDepthEntries, resolveWorldbookEntries } from './worldbook';
 import { normalizeTranslationLangLabel } from './translationLang';
+import { resolveOmbreProviderConfig } from './ombre/ombreConfig';
+import { buildOmbreSystemPrompt } from './ombre/ombrePromptProvider';
+import type { OmbreMemoryPlan, OmbrePromptMeta } from './ombre/ombreTypes';
 
 export interface UserListeningContext {
     songName: string;
@@ -95,6 +98,8 @@ export interface BuildChatPayloadResult {
     cleanedApiMessages: Array<{ role: string; content: any }>;
     /** [system, ...cleanedApiMessages, 末尾 bilingual reminder?] —— 主 API 直接发这个 */
     fullMessages: Array<{ role: string; content: any }>;
+    ombreMeta?: OmbrePromptMeta;
+    ombreMemoryPlan?: OmbreMemoryPlan;
     /** 调试用：bilingual / mcd 是否实际注入 */
     flags: {
         bilingualActive: boolean;
@@ -201,6 +206,104 @@ export function flattenImageContentParts(apiMessages: Array<{ role: string; cont
     });
 }
 
+function buildOmbreProtocolChar(char: CharacterProfile, ombreSystemPrompt: string): CharacterProfile {
+    return {
+        ...char,
+        systemPrompt: ombreSystemPrompt,
+        memories: [],
+        refinedMemories: {},
+        activeMemoryMonths: [],
+        mountedWorldbooks: [],
+        impression: undefined,
+        memoryPalaceEnabled: false,
+        memoryPalaceInjection: '',
+        roomPlatesInjection: '',
+        selfInsights: [],
+    };
+}
+
+function extractSullyNativeChatProtocol(stablePrompt: string): string {
+    const marker = '### 聊天 App 行为规范 (Chat App Rules)';
+    const index = stablePrompt.indexOf(marker);
+    if (index < 0) return '';
+    return stablePrompt.slice(index).trim();
+}
+
+function buildOmbreStableChatPrompt(ombreSystemPrompt: string, sullyStablePrompt: string): string {
+    const nativeProtocol = extractSullyNativeChatProtocol(sullyStablePrompt);
+    if (!nativeProtocol) return ombreSystemPrompt;
+    return `${ombreSystemPrompt}\n\n## SullyOS Native Chat Protocol\n${nativeProtocol}`;
+}
+
+function assembleChatMessagesWithCurrentUserLast(
+    stableSystemPrompt: string,
+    historyMessages: Array<{ role: string; content: any }>,
+    volatileTail: string,
+): Array<{ role: string; content: any }> {
+    const stableSystem = { role: 'system', content: stableSystemPrompt };
+    const tailSystem = { role: 'system', content: volatileTail };
+    const lastHistoryMessage = historyMessages[historyMessages.length - 1];
+
+    if (lastHistoryMessage?.role === 'user') {
+        return [
+            stableSystem,
+            ...historyMessages.slice(0, -1),
+            tailSystem,
+            lastHistoryMessage,
+        ];
+    }
+
+    return [
+        stableSystem,
+        ...historyMessages,
+        tailSystem,
+    ];
+}
+
+export async function buildBaseSystemPromptForChat(input: BuildChatPayloadInput): Promise<{
+    systemPrompt: string;
+    ombreMeta?: OmbrePromptMeta;
+    ombreMemoryPlan?: OmbreMemoryPlan;
+}> {
+    const {
+        char, userProfile, groups, emojis, categories, historyMsgs,
+        realtimeConfig, innerState,
+    } = input;
+    const recentMsgsHint = input.recentMsgsHint ?? historyMsgs;
+    const ombreConfig = resolveOmbreProviderConfig(char as any, userProfile as any);
+
+    if (ombreConfig.enabled) {
+        const result = await buildOmbreSystemPrompt({
+            char,
+            userProfile,
+            groups,
+            emojis,
+            categories,
+            recentMsgsHint,
+            realtimeConfig,
+            innerState: innerState || undefined,
+            feature: 'chat',
+            recallQueryHint: input.recallQueryHint,
+            config: ombreConfig,
+        });
+        return {
+            systemPrompt: result.systemPrompt,
+            ombreMeta: result.promptMeta,
+            ombreMemoryPlan: result.memoryPlan,
+        };
+    }
+
+    const systemPrompt = await ChatPrompts.buildSystemPrompt(
+        char, userProfile, groups, emojis, categories, recentMsgsHint,
+        realtimeConfig, innerState || undefined,
+        input.userListeningContext ?? null,
+        !!input.isListeningTogether,
+        input.musicCfg,
+    );
+
+    return { systemPrompt };
+}
+
 /**
  * 构造完整 chat 请求载荷。三段式结构（稳定前缀 / 历史 / 易变尾段）：
  *
@@ -236,6 +339,9 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         char.id,
     );
     const recentMsgsHint = input.recentMsgsHint ?? historyMsgs;
+    const ombreConfig = resolveOmbreProviderConfig(char as any, userProfile as any);
+    let ombreMeta: OmbrePromptMeta | undefined;
+    let ombreMemoryPlan: OmbreMemoryPlan | undefined;
 
     if (isPromptBuildSkipped()) {
         const { apiMessages } = ChatPrompts.buildMessageHistory(historyMsgs, contextLimit, char, userProfile, emojis);
@@ -259,7 +365,9 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     }
 
     // ── 1. Memory Palace 向量召回 ─────────────────────────
-    await injectMemoryPalace(char, recentMsgsHint, input.recallQueryHint, userProfile?.name);
+    if (!ombreConfig.enabled) {
+        await injectMemoryPalace(char, recentMsgsHint, input.recallQueryHint, userProfile?.name);
+    }
 
     // ── 2. 解析音乐共听（如果 caller 没显式给，就从 snapshot 推） ──
     let userListeningContext = input.userListeningContext;
@@ -281,15 +389,39 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     // volatileTail → 历史消息之后的 system（时间/召回/buff/日程/音乐等实时状态 + 点单类模式块）；
     // recencyTail（总纲+「回到你自己」钢印）最后拼进 volatileTail 末尾，保证它是模型
     // 开口前读到的最后内容 —— 双语/HTML/思考链等格式块都只能拼在 stable 里、排它前面。
+    let promptChar = char;
+    let ombreSystemPrompt: string | undefined;
+    if (ombreConfig.enabled) {
+        const ombre = await buildOmbreSystemPrompt({
+            char,
+            userProfile,
+            groups,
+            emojis,
+            categories,
+            recentMsgsHint,
+            realtimeConfig,
+            innerState: innerState || undefined,
+            feature: 'chat',
+            recallQueryHint: input.recallQueryHint,
+            config: ombreConfig,
+        });
+        ombreSystemPrompt = ombre.systemPrompt;
+        promptChar = buildOmbreProtocolChar(char, ombre.systemPrompt);
+        ombreMeta = ombre.promptMeta;
+        ombreMemoryPlan = ombre.memoryPlan;
+    }
+
     const parts = await ChatPrompts.buildSystemPromptParts(
-        char, userProfile, groups, emojis, categories, recentMsgsHint,
+        promptChar, userProfile, groups, emojis, categories, recentMsgsHint,
         realtimeConfig, innerState || undefined,
         userListeningContext ?? null,
         !!isListeningTogether,
         musicCfg,
         recentTrackSwitch,
     );
-    let systemPrompt = parts.stable;
+    let systemPrompt = ombreSystemPrompt
+        ? buildOmbreStableChatPrompt(ombreSystemPrompt, parts.stable)
+        : parts.stable;
     let volatileTail = parts.volatileState;
 
     // ── 4. 双语指令注入 ───────────────────────────────────
@@ -397,25 +529,22 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     // 思考链/点单块拼在钢印之后、模型开口前最后读到的是格式说明书的问题。
     volatileTail += parts.recencyTail;
 
-    // 结构：[稳定 system] + [历史消息] + [易变状态 system] (+ 末尾 reminder)。
+    // 结构：[稳定 system] + [较早历史消息] + [易变状态 system] + [最新 user]。
     // 稳定前缀不再包含分钟级时间戳等易变内容 → 支持前缀缓存的中转能跨轮命中；
-    // 易变状态贴着生成点注入，时间/情绪/日程反而拿到最强 recency 注意力。
+    // 易变状态贴着最新用户消息前注入，时间/情绪/日程不打断缓存，也不抢占最终 user 位。
     // 注意：instant push 的 worker 端情绪评估把 messages[0] 当 system、messages[1..]
     // 展平为对话历史 —— 易变尾段会以「[系统]: …」行出现在历史末尾，信息不丢。
-    const fullMessages: Array<{ role: string; content: any }> = [
-        { role: 'system', content: systemPrompt },
-        ...messagesWithWorldbookDepth,
-        { role: 'system', content: volatileTail },
-    ];
     if (bilingualActive) {
-        fullMessages.push({
-            role: 'system',
-            content: `[Reminder: 每句话必须用 <翻译><原文>...</原文><译文>...</译文></翻译> 标签包裹。一句一个标签。绝对不能省略。]`,
-        });
+        volatileTail += `\n\n[Reminder: 每句话必须用 <翻译><原文>...</原文><译文>...</译文></翻译> 标签包裹。一句一个标签。绝对不能省略。]`;
     }
     if (mcpChatActive) {
-        fullMessages.push({ role: 'system', content: MCP_TAIL_REMINDER });
+        volatileTail += `\n\n${MCP_TAIL_REMINDER}`;
     }
+    const fullMessages = assembleChatMessagesWithCurrentUserLast(
+        systemPrompt,
+        messagesWithWorldbookDepth,
+        volatileTail,
+    );
 
     // Dev 开关：多条 system 合并成开头一条，A/B 对照中转适配层对多 system 的计量行为。
     let finalMessages = fullMessages;
@@ -430,6 +559,8 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         systemPrompt: systemPrompt + volatileTail,
         cleanedApiMessages: messagesWithWorldbookDepth,
         fullMessages: finalMessages,
+        ombreMeta,
+        ombreMemoryPlan,
         flags: { bilingualActive, mcdActive, luckinActive, luckinChatActive, mcpChatActive, htmlActive, thinkingActive, promptBuildSkipped: false },
     };
 }

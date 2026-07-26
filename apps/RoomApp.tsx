@@ -4,8 +4,9 @@ import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { RoomItem, CharacterProfile, RoomTodo, RoomNote, DailySchedule, AppID } from '../types';
 import ScheduleCard from '../components/schedule/ScheduleCard';
-import { ContextBuilder } from '../utils/context';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
+import { resolveOmbreProviderConfig } from '../utils/ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from '../utils/ombre/featurePrompt';
 import { processImageToBlob } from '../utils/file';
 import { putImageBlob, useBlobRefUrl, isBlobRef, migrateDataUrlToRef, resolveBlobRefsDeep } from '../utils/blobRef';
 import TokenImg from '../components/os/TokenImg';
@@ -624,7 +625,14 @@ const RoomApp: React.FC = () => {
     const initializeFallback = async (c: CharacterProfile) => {
         try {
             console.warn("Triggering Room Fallback Initialization");
-            const baseContext = ContextBuilder.buildCoreContext(c, userProfile, false);
+            const baseContext = (await buildOmbreFeatureSystemPrompt({
+                char: c,
+                userProfile,
+                feature: 'room',
+                recentMsgsHint: [],
+                includeDetailedMemories: false,
+                recallQueryHint: c.name,
+            })).systemPrompt;
             const fallbackPrompt = `${baseContext}\n\nTask: User entered your room. Just say hello. JSON: { "welcomeMessage": "..." }`;
             
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
@@ -725,8 +733,18 @@ const RoomApp: React.FC = () => {
             const lastMsg = recentMsgs[recentMsgs.length - 1];
             const timeGapHint = getTimeGapHint(lastMsg?.timestamp);
 
-            await injectMemoryPalace(c, recentMsgs);
-            const baseContext = ContextBuilder.buildCoreContext(c, userProfile, true); // Keep Full Context
+            const ombreEnabled = resolveOmbreProviderConfig(c as any, userProfile as any).enabled;
+            if (!ombreEnabled) {
+                await injectMemoryPalace(c, recentMsgs);
+            }
+            const baseContext = (await buildOmbreFeatureSystemPrompt({
+                char: c,
+                userProfile,
+                feature: 'room',
+                recentMsgsHint: recentMsgs,
+                includeDetailedMemories: true,
+                recallQueryHint: c.name,
+            })).systemPrompt; // Keep Full Context
 
             // DEBUG FIX: Sanitize and truncate interactables context to prevent huge Base64 leakage
             const interactables = currentItems.filter(i => i.isInteractive).map(i => ({

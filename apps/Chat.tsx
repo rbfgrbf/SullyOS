@@ -36,6 +36,7 @@ import CharacterEntryTransition from '../components/chat/CharacterEntryTransitio
 import ChromeCssEditor from '../components/chat/ChromeCssEditor';
 import ChatInputArea from '../components/chat/ChatInputArea';
 import ChatModals from '../components/chat/ChatModals';
+import OmbreMemoryReviewCard from '../components/chat/OmbreMemoryReviewCard';
 import Modal from '../components/os/Modal';
 import ProactiveSettingsModal from '../components/chat/ProactiveSettingsModal';
 import ThinkingChainSettingsModal from '../components/chat/ThinkingChainSettingsModal';
@@ -265,7 +266,7 @@ const Chat: React.FC = () => {
     }, []);
 
     // --- Initialize Hook ---
-    const { isTyping, streamingBubbles, streamingThinking, recallStatus, searchStatus, diaryStatus, emotionStatus, memoryPalaceStatus, memoryPalaceResult, setMemoryPalaceResult, lastDigestResult, setLastDigestResult, lastTokenUsage, tokenBreakdown, setLastTokenUsage, triggerAI, startProactiveChat, stopProactiveChat, isProactiveActive } = useChatAI({
+    const { isTyping, streamingBubbles, streamingThinking, recallStatus, searchStatus, diaryStatus, emotionStatus, memoryPalaceStatus, memoryPalaceResult, setMemoryPalaceResult, lastDigestResult, setLastDigestResult, lastTokenUsage, tokenBreakdown, setLastTokenUsage, triggerAI, startProactiveChat, stopProactiveChat, isProactiveActive, ombreMemoryReviewItem, approveOmbreMemoryReview, rejectOmbreMemoryReview, editOmbreMemoryReviewDraft } = useChatAI({
         char,
         userProfile,
         apiConfig,
@@ -3388,6 +3389,13 @@ const Chat: React.FC = () => {
                     </div>
                 )}
                 
+                <OmbreMemoryReviewCard
+                    item={ombreMemoryReviewItem}
+                    onEdit={editOmbreMemoryReviewDraft}
+                    onApprove={approveOmbreMemoryReview}
+                    onReject={rejectOmbreMemoryReview}
+                />
+
                 <ChatInputArea
                     input={input} setInput={handleInputChange}
                     isTyping={isTyping} selectionMode={selectionMode}

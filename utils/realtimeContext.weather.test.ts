@@ -13,6 +13,7 @@ function jsonResponse(body: any, ok = true, status = 200) {
     return {
         ok,
         status,
+        headers: { get: () => 'application/json' },
         text: async () => JSON.stringify(body),
     } as any;
 }

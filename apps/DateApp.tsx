@@ -248,7 +248,7 @@ const DateApp: React.FC = () => {
         try {
             const msgs = await DB.getMessagesByCharId(c.id, true);
             const emojis = await DB.getEmojis();
-            const { messages } = DatePrompts.buildPeekPayload({
+            const { messages } = await DatePrompts.buildPeekPayload({
                 char: c,
                 userProfile,
                 allMsgs: msgs,
@@ -408,7 +408,7 @@ const DateApp: React.FC = () => {
         // 新消息也不带 isOpening，阅读模式会从上一次见面的开场开始切片，表现为
         // 「新见面只有立绘模式是新剧情，阅读模式全是旧剧情」。
         if (lastMsg.metadata?.isOpening === true) {
-            const { messages } = DatePrompts.buildPeekPayload({ char, userProfile, allMsgs: validMsgs, emojis });
+            const { messages } = await DatePrompts.buildPeekPayload({ char, userProfile, allMsgs: validMsgs, emojis });
             const content = await callLLM(messages, Math.max(apiConfig.temperature ?? 0.85, 0.9));
             // 生成成功后才动库：先删旧开场、再带 isOpening 落新开场，请求失败时原剧情不丢
             await DB.deleteMessage(lastMsg.id);

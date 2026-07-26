@@ -3,13 +3,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { CharacterProfile, DiaryEntry, StickerData, DiaryPage, MemoryFragment } from '../types';
-import { ContextBuilder } from '../utils/context';
 import { processImage } from '../utils/file';
 import Modal from '../components/os/Modal';
 import { safeResponseJson, extractJson } from '../utils/safeApi';
 import { normalizeMessageContent } from '../utils/messageFormat';
 import { injectMemoryPalace, ingestDiaryToPalace, type DiaryIngestResult } from '../utils/memoryPalace/pipeline';
 import { getRoomLabel } from '../utils/memoryPalace/types';
+import { resolveOmbreProviderConfig } from '../utils/ombre/ombreConfig';
+import { buildOmbreFeatureSystemPrompt } from '../utils/ombre/featurePrompt';
 import { Sparkle, Archive } from '@phosphor-icons/react';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 
@@ -418,8 +419,19 @@ const JournalApp: React.FC = () => {
         saveEntry(); 
 
         try {
-            await injectMemoryPalace(selectedChar, undefined, currentEntry.userPage.text);
-            let systemPrompt = ContextBuilder.buildCoreContext(selectedChar, userProfile);
+            const recentMsgs = await DB.getMessagesByCharId(selectedChar.id);
+            const ombreEnabled = resolveOmbreProviderConfig(selectedChar as any, userProfile as any).enabled;
+            if (!ombreEnabled) {
+                await injectMemoryPalace(selectedChar, undefined, currentEntry.userPage.text);
+            }
+            let systemPrompt = (await buildOmbreFeatureSystemPrompt({
+                char: selectedChar,
+                userProfile,
+                feature: 'diary',
+                recentMsgsHint: recentMsgs,
+                recallQueryHint: currentEntry.userPage.text,
+                includeDetailedMemories: true,
+            })).systemPrompt;
 
             const styleOptions = PAPER_STYLES.map(p => p.id).join(', ');
             const defaultStickers = DEFAULT_STICKERS.join(' ');
@@ -427,7 +439,6 @@ const JournalApp: React.FC = () => {
                 ? `Custom Stickers (Name: URL): \n${customStickers.map(s => `- ${s.name}: ${s.url}`).join('\n')}`
                 : '';
 
-            const recentMsgs = await DB.getMessagesByCharId(selectedChar.id);
             const contextLimit = 30;
             // 用统一的 normalizeMessageContent 把消息转成可读文本，绝不能直接塞 m.content：
             // score_card（含上一次交换日记同步进来的卡片）的 content 是整段 JSON，里面带
@@ -554,7 +565,14 @@ Structure:
 
         // 主 API 散文式总结 — 当宫殿没开 / 副 API 缺失 / 提取为空时的 fallback
         const generateProseSummary = async (): Promise<string> => {
-            const baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile);
+            const baseContext = (await buildOmbreFeatureSystemPrompt({
+                char: selectedChar,
+                userProfile,
+                feature: 'diary',
+                recentMsgsHint: [],
+                recallQueryHint: `${diary.date}\n${diary.userPage.text}\n${diary.charPage?.text || ''}`,
+                includeDetailedMemories: true,
+            })).systemPrompt;
             const charPart = diary.charPage?.text?.trim() || '(对方没有回复)';
             const prompt = `${baseContext}
 

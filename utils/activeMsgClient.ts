@@ -5,6 +5,7 @@ import {
   APIConfig,
   CharacterProfile,
   GroupProfile,
+  Message,
   RealtimeConfig,
   UserProfile,
 } from '../types';
@@ -13,6 +14,9 @@ import { DB } from './db';
 import { safeResponseJson } from './safeApi';
 import { ActiveMsgStore } from './activeMsgStore';
 import { KeepAlive } from './keepAlive';
+import { resolveOmbreProviderConfig } from './ombre/ombreConfig';
+import { buildOmbreSystemPrompt } from './ombre/ombrePromptProvider';
+import { buildFeatureAddendum } from './ombre/featureAdapters';
 
 const ACTIVE_MSG_VAPID_PUBLIC_KEY = import.meta.env.VITE_AMSG_VAPID_PUBLIC_KEY || '';
 const ACTIVE_MSG_API_BASE_OVERRIDE = (import.meta.env.VITE_AMSG_API_BASE_URL || '').trim();
@@ -124,10 +128,20 @@ const normalizeActiveMsgApiError = (error: unknown, phase: string) => {
   return error instanceof Error ? error : new Error(message);
 };
 
-const withAuthorizationPatchedFetch = async <T>(tenantToken: string, fn: () => Promise<T>) => {
+const isActiveMsgApiRequest = (input: RequestInfo | URL, apiBase: string): boolean => {
+  const rawUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+  const requestUrl = new URL(rawUrl, window.location.href).toString();
+  const normalizedBase = apiBase.replace(/\/+$/, '');
+  return requestUrl === normalizedBase || requestUrl.startsWith(`${normalizedBase}/`);
+};
+
+export const withAuthorizationPatchedFetch = async <T>(tenantToken: string, apiBase: string, fn: () => Promise<T>) => {
   const originalFetch = window.fetch.bind(window);
 
   const patchedFetch: typeof window.fetch = (input, init = {}) => {
+    if (!isActiveMsgApiRequest(input, apiBase)) {
+      return originalFetch(input, init);
+    }
     const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
     headers.set('Authorization', `Bearer ${tenantToken}`);
     return originalFetch(input, { ...init, headers });
@@ -156,7 +170,7 @@ const ensureTenantReady = async () => {
 const initializeClient = async (config: ActiveMsg2GlobalConfig) => {
   const client = createClient(config.userId);
   try {
-    await withAuthorizationPatchedFetch(config.tenantToken || '', () => client.init());
+    await withAuthorizationPatchedFetch(config.tenantToken || '', resolveActiveMsgApiBase(), () => client.init());
   } catch (error) {
     throw normalizeActiveMsgApiError(error, '获取用户密钥');
   }
@@ -240,6 +254,43 @@ const buildLegacyStyleProactiveHint = (
   ].join('\n');
 };
 
+export async function buildProactiveSystemPrompt(
+  char: CharacterProfile,
+  userProfile: UserProfile,
+  groups: GroupProfile[],
+  emojis: any[],
+  categories: any[],
+  recentMessages: Message[],
+  realtimeConfig: RealtimeConfig,
+): Promise<string> {
+  const ombreConfig = resolveOmbreProviderConfig(char as any, userProfile as any);
+  if (ombreConfig.enabled) {
+    const provider = await buildOmbreSystemPrompt({
+      char,
+      userProfile,
+      groups,
+      emojis,
+      categories,
+      recentMsgsHint: recentMessages,
+      realtimeConfig,
+      feature: 'proactive',
+      config: ombreConfig,
+    });
+    const addendum = buildFeatureAddendum('proactive', { targetName: userProfile.name || '用户' });
+    return [provider.systemPrompt, addendum].filter(Boolean).join('\n\n');
+  }
+
+  return ChatPrompts.buildSystemPrompt(
+    char,
+    userProfile,
+    groups,
+    emojis,
+    categories,
+    recentMessages,
+    realtimeConfig,
+  );
+}
+
 const buildCompletePrompt = async (
   char: CharacterProfile,
   config: ActiveMsg2CharacterConfig,
@@ -257,7 +308,7 @@ const buildCompletePrompt = async (
     await DB.getEmojiCategories(),
     char.id,
   );
-  const systemPrompt = await ChatPrompts.buildSystemPrompt(
+  const systemPrompt = await buildProactiveSystemPrompt(
     char,
     userProfile,
     groups,

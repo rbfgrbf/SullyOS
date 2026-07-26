@@ -11,9 +11,9 @@
  */
 
 import { CharacterProfile, UserProfile, XhsActivityRecord, XhsFreeRoamSession, APIConfig, RealtimeConfig } from '../types';
-import { ContextBuilder } from './context';
 import { XhsMcpClient, McpToolResult, extractNotesFromMcpData, normalizeNote } from './xhsMcpClient';
 import { DB } from './db';
+import { buildOmbreFeatureSystemPrompt } from './ombre/featurePrompt';
 
 // ==================== Types ====================
 
@@ -94,13 +94,11 @@ const parseJson = <T>(text: string): T | null => {
 // ==================== Prompt Builders ====================
 
 const buildFreeRoamSystemPrompt = (
-    char: CharacterProfile,
+    baseContext: string,
     user: UserProfile,
     recentChatSummary: string,
     pastActivities: XhsActivityRecord[],
 ): string => {
-    // 加载完整上下文（含详细记忆和心情标签），让角色在自由活动时保持情感连贯
-    const coreContext = ContextBuilder.buildCoreContext(char, user, true);
     const now = new Date();
     const timeStr = `${now.getFullYear()}-${(now.getMonth()+1).toString().padStart(2,'0')}-${now.getDate().toString().padStart(2,'0')} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
     const hour = now.getHours();
@@ -116,7 +114,7 @@ const buildFreeRoamSystemPrompt = (
         }).join('\n');
     }
 
-    return `${coreContext}
+    return `${baseContext}
 
 ### 🕐 当前状态
 - 现在是: ${timeStr} (${timeOfDay})
@@ -440,8 +438,18 @@ export const XhsFreeRoamEngine = {
             // 1. Build context
             callbacks.onStatus(`${char.name}正在思考...`);
             const pastActivities = await DB.getXhsActivities(char.id, 10);
-            const chatSummary = await getRecentChatContext(char.id, char.contextLimit || 500);
-            const systemPrompt = buildFreeRoamSystemPrompt(char, user, chatSummary, pastActivities);
+            const contextLimit = char.contextLimit || 500;
+            const chatSummary = await getRecentChatContext(char.id, contextLimit);
+            const recentMsgsHint = await DB.getRecentMessagesByCharId(char.id, contextLimit).catch(() => []);
+            const basePrompt = await buildOmbreFeatureSystemPrompt({
+                char,
+                userProfile: user,
+                feature: 'xhs',
+                recentMsgsHint,
+                includeDetailedMemories: true,
+                recallQueryHint: `${char.name} xhs free roam`,
+            });
+            const systemPrompt = buildFreeRoamSystemPrompt(basePrompt.systemPrompt, user, chatSummary, pastActivities);
 
             // 4. Character decides
             callbacks.onStatus(`${char.name}在决定做什么...`);
