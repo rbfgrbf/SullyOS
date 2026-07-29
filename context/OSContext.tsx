@@ -55,9 +55,21 @@ import { exportMcdLocal } from '../utils/mcdMcpClient';
 import { exportDesktopSkinLocal } from '../utils/desktopSkinBackup';
 import { assertSupportedSullyBackup } from '../utils/backupImportPolicy';
 import { exportOmbreLocal } from '../utils/ombre/ombreGlobalConfig';
+import {
+  buildExternalWakeHint,
+  createExternalWakePoller,
+  loadExternalWakeClientConfig,
+  loadExternalWakeTargetCharId,
+  resolveExternalWakeCharacterId,
+  type ExternalWakeEvent,
+} from '../utils/externalWake';
+import { createOmbreDigestScheduler } from '../utils/ombre/ombreDigestScheduler';
+import { defaultDigestRunnerDeps, runOmbreDigestCheck } from '../utils/ombre/ombreDigestRunner';
+import { loadOmbreDigestConfig, OMBRE_DIGEST_TARGET_CHAR_ID } from '../utils/ombre/ombreDigestConfig';
 
 interface ProactiveQueueEntry {
   charId: string;
+  externalWake?: ExternalWakeEvent;
 }
 
 const normalizeProactiveAiContent = (raw: string): string => {
@@ -1088,14 +1100,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               if (urlStr.includes('/chat/completions')) {
                   recordApiCall({ url: urlStr, body: (sendArgs[1] as any)?.body, ok: false, meta: (config as any)?.__sullyMeta || ambientMetaAtStart, durationMs: Date.now() - fetchStartedAt });
               }
-              setSystemLogs(prev => [{
-                  id: `log-${Date.now()}`,
-                  timestamp: Date.now(),
-                  type: 'network',
-                  source: 'Network',
-                  message: err.message || 'Fetch Failed',
-                  detail: `URL: ${urlStr}`
-              }, ...prev.slice(0, 49)]);
+              if (!(config as any)?.__sullySilentNetworkError) {
+                  setSystemLogs(prev => [{
+                      id: `log-${Date.now()}`,
+                      timestamp: Date.now(),
+                      type: 'network',
+                      source: 'Network',
+                      message: err.message || 'Fetch Failed',
+                      detail: `URL: ${urlStr}`
+                  }, ...prev.slice(0, 49)]);
+              }
               throw err;
           }
       };
@@ -1514,6 +1528,42 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   activeAppRef.current = activeApp;
   activeCharIdScheduleRef.current = activeCharacterId;
 
+  const ombreDigestSchedulerRef = useRef<ReturnType<typeof createOmbreDigestScheduler> | null>(null);
+  const ombreDigestCharactersRef = useRef(characters);
+  const ombreDigestRecoverySignatureRef = useRef('');
+  ombreDigestCharactersRef.current = characters;
+  const ombreDigestTargetLoaded = characters.some(character => character.id === OMBRE_DIGEST_TARGET_CHAR_ID);
+  useEffect(() => {
+      const scheduler = createOmbreDigestScheduler({
+          targetCharId: OMBRE_DIGEST_TARGET_CHAR_ID,
+          run: (charId, reason) => runOmbreDigestCheck(charId, reason, {
+              ...defaultDigestRunnerDeps,
+              loadConfig: loadOmbreDigestConfig,
+          }),
+      });
+      ombreDigestSchedulerRef.current = scheduler;
+      return () => {
+          scheduler.dispose();
+          ombreDigestSchedulerRef.current = null;
+      };
+  }, []);
+
+  useEffect(() => {
+      if (!isDataLoaded || !ombreDigestTargetLoaded) return;
+      const signature = OMBRE_DIGEST_TARGET_CHAR_ID;
+      if (ombreDigestRecoverySignatureRef.current === signature) return;
+      ombreDigestRecoverySignatureRef.current = signature;
+      void ombreDigestSchedulerRef.current?.recover([OMBRE_DIGEST_TARGET_CHAR_ID]);
+  }, [isDataLoaded, ombreDigestTargetLoaded]);
+
+  useEffect(() => {
+      if (!isDataLoaded || !ombreDigestTargetLoaded) return;
+      const timer = window.setInterval(() => {
+          void ombreDigestSchedulerRef.current?.request(OMBRE_DIGEST_TARGET_CHAR_ID, 'period-boundary');
+      }, 60_000);
+      return () => window.clearInterval(timer);
+  }, [isDataLoaded, ombreDigestTargetLoaded]);
+
   // 当前聊天视图快照 → 模块级 slot（utils/chatGenEvents）。根级 ChatBroadcast 挂在
   // OSProvider 之外拿不到这两个 state，靠快照判断"用户正看着的会话不弹全局横幅"。
   useEffect(() => {
@@ -1670,6 +1720,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       const handler = (e: Event) => {
           const { charId, charName, body } = (e as CustomEvent).detail as { charId: string; charName: string; body?: string };
+          void ombreDigestSchedulerRef.current?.request(charId, 'round-threshold');
           setLastMsgTimestamp(Date.now());
 
           const isChattingWithThisChar = activeAppRef.current === AppID.Chat && activeCharIdScheduleRef.current === charId;
@@ -1697,6 +1748,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       const onVisible = () => {
           if (document.visibilityState !== 'visible') return;
+          if (ombreDigestCharactersRef.current.some(character => character.id === OMBRE_DIGEST_TARGET_CHAR_ID)) {
+              void ombreDigestSchedulerRef.current?.recover([OMBRE_DIGEST_TARGET_CHAR_ID]);
+          }
           if (awayActiveMsgCount > 0) {
               addToast(`你离开期间收到 ${awayActiveMsgCount} 条新消息`, 'success');
               awayActiveMsgCount = 0;
@@ -1750,6 +1804,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       const chatReplyArrivedHandler = (e: Event) => {
           const { charId, charName } = ((e as CustomEvent).detail || {}) as { charId?: string; charName?: string };
           if (!charId) return;
+          void ombreDigestSchedulerRef.current?.request(charId, 'round-threshold');
           setLastMsgTimestamp(Date.now());
           const isChattingWithThisChar = activeAppRef.current === AppID.Chat && activeCharIdScheduleRef.current === charId;
           if (!isChattingWithThisChar) {
@@ -1842,15 +1897,20 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       const drainQueuedProactive = () => {
           const next = proactiveQueueRef.current.shift();
           if (next) {
-              void runProactive(next.charId);
+              void runProactive(next.charId, next.externalWake ? { externalWake: next.externalWake } : undefined);
           }
       };
 
-      const runProactive = async (charId: string) => {
+      const runProactive = async (charId: string, options?: { externalWake?: ExternalWakeEvent }) => {
+          const externalWake = options?.externalWake;
           if (proactiveRunningRef.current) {
-              const queuedIndex = proactiveQueueRef.current.findIndex(item => item.charId === charId);
+              const queuedIndex = proactiveQueueRef.current.findIndex(item =>
+                  externalWake
+                      ? item.externalWake?.id === externalWake.id
+                      : item.charId === charId && !item.externalWake
+              );
               if (queuedIndex < 0) {
-                  proactiveQueueRef.current.push({ charId });
+                  proactiveQueueRef.current.push({ charId, ...(externalWake ? { externalWake } : {}) });
               }
               return;
           }
@@ -1868,7 +1928,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               return;
           }
 
-          if (char.proactiveConfig && !char.proactiveConfig.enabled) {
+          if (!externalWake && char.proactiveConfig && !char.proactiveConfig.enabled) {
               drainQueuedProactive();
               console.log(`🔕 [Proactive/Global] Skipped for ${char.name}: disabled`);
               return;
@@ -1877,7 +1937,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 用户正在 DateApp 里和这个角色见面 —— 人就在对方眼前，再发一条
           // 线上主动消息既出戏又显得对见面毫不知情。本轮静默跳过；
           // lastFire 已在调度层记录，下个周期会重新评估。
-          if (activeAppRef.current === AppID.Date && activeCharIdScheduleRef.current === charId) {
+          if (!externalWake && activeAppRef.current === AppID.Date && activeCharIdScheduleRef.current === charId) {
               drainQueuedProactive();
               console.log(`🔕 [Proactive/Global] Skipped for ${char.name}: 正在见面 (DateApp active)`);
               return;
@@ -1886,8 +1946,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 用户正在和这个角色通话（含通话被挂起到后台）—— 通话里再塞一条线上
           // 主动消息，不仅出戏，主动消息的提示词还会污染上下文、把后续语音
           // 带成线上消息格式。本轮静默跳过；下个周期会重新评估。
-          if ((activeAppRef.current === AppID.Call && activeCharIdScheduleRef.current === charId)
-              || suspendedCallRef.current?.charId === charId) {
+          if (!externalWake && ((activeAppRef.current === AppID.Call && activeCharIdScheduleRef.current === charId)
+              || suspendedCallRef.current?.charId === charId)) {
               drainQueuedProactive();
               console.log(`🔕 [Proactive/Global] Skipped for ${char.name}: 正在通话 (CallApp active)`);
               return;
@@ -1895,7 +1955,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
           // Determine which API to use
           const pCfg = char.proactiveConfig;
-          const useSecondary = pCfg?.useSecondaryApi && pCfg.secondaryApi?.baseUrl;
+          const useSecondary = !externalWake && pCfg?.useSecondaryApi && pCfg.secondaryApi?.baseUrl;
           const api = useSecondary ? pCfg!.secondaryApi! : currentApiConfig;
           if (!api.baseUrl) {
               drainQueuedProactive();
@@ -1904,7 +1964,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
           proactiveRunningRef.current = true;
           setProactiveComposingChars(prev => prev[charId] ? prev : { ...prev, [charId]: true });
-          console.log(`🔔 [Proactive/Global] Trigger fired for ${char.name}${useSecondary ? ' (副API)' : ''}`);
+          console.log(externalWake
+              ? `🔔 [ExternalWake] Trigger fired for ${char.name}: ${externalWake.reason}`
+              : `🔔 [Proactive/Global] Trigger fired for ${char.name}${useSecondary ? ' (副API)' : ''}`);
 
           try {
               // 1. Calculate time gap
@@ -1937,7 +1999,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               const justMetOffline = lastRealMsgRaw?.metadata?.source === 'date'
                   && (now.getTime() - lastRealMsgRaw.timestamp) < DATE_AFTERGLOW_MS;
 
-              const hintContent = justMetOffline
+              const hintContent = externalWake
+                      ? buildExternalWakeHint({
+                          wake: externalWake,
+                          userName,
+                          timeText: timeStr,
+                      })
+                      : justMetOffline
                       ? `[系统提示（非${userName}发言）: 现在是 ${timeStr}。你和${userName}刚刚在线下见过面（如果上下文里有标着 [约会] 的内容，那就是你们见面时发生的事），现在你们暂时分开了，你拿起手机想给${userName}发条消息。请基于刚才的见面来发——可以回味见面里的某个细节、补一句当时没说出口的话、关心${userName}到家了没，或者就是刚分开就有点想念。绝对不要表现得好像很久没联系，更不要对刚才的见面毫不知情。一两句话就好。]`
                       : `[系统提示（非${userName}发言）: 现在是 ${timeStr}。${timeSinceUser ? `${userName}已经 ${timeSinceUser} 没有找你说话了。` : ''}这是系统给你的一次主动发消息机会——${userName}并没有在跟你说话，是你想主动找${userName}。像真人一样随意地发条消息吧，比如：随手拍了张照片想分享、刚看到个有趣的事想说、突然想到个冷知识、吐槽今天的天气/食物/见闻、或者就是单纯想找${userName}聊几句。不要刻意，不要像在"汇报近况"，就像你真的拿起手机随手发了条消息。一两句话就好。${timeSinceUser && parseInt(timeSinceUser) > 2 ? `（${userName}挺久没找你了，你也可以表达想念、好奇${userName}在干嘛、或者小小地抱怨一下。）` : ''}]`;
 
@@ -1946,7 +2014,18 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   role: 'user',
                   type: 'text',
                   content: hintContent,
-                  metadata: { proactiveHint: true, hidden: true }
+                  metadata: {
+                      proactiveHint: true,
+                      hidden: true,
+                      ...(externalWake ? {
+                          externalWake: {
+                              id: externalWake.id,
+                              reason: externalWake.reason,
+                              source: externalWake.source,
+                              receivedAt: externalWake.receivedAt,
+                          },
+                      } : {}),
+                  }
               });
 
               // 3. Build prompt & message history — 走和 useChatAI / emotion eval 同一个 helper，
@@ -1978,9 +2057,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   innerState: cachedInnerState,
                   // 实时音乐播放状态 —— OSContext 在 MusicProvider 上层用不了 useMusic()，
                   // 走 MusicContext 暴露的模块级快照（Provider mount 后会持续写入）
-                  musicSnapshot: loadMusicPlaybackSnapshot(),
-                  // translationConfig / mcdMiniSnap 是 chat-app 会话级 UI 状态，主动消息触发时
-                  // 不存在；保持 undefined 即可，与"用户当时根本没在 chat 界面"的语义一致
+                   musicSnapshot: loadMusicPlaybackSnapshot(),
+                   recallQueryHint: externalWake?.message,
+                   // translationConfig / mcdMiniSnap 是 chat-app 会话级 UI 状态，主动消息触发时
+                   // 不存在；保持 undefined 即可，与"用户当时根本没在 chat 界面"的语义一致
                   htmlMode: { enabled: !!(char as any).htmlModeEnabled, customPrompt: (char as any).htmlModeCustomPrompt },
                   thinkingChain: { enabled: !!(char as any).showThinkingChain, customPrompt: (char as any).thinkingChainCustomPrompt },
               });
@@ -2022,10 +2102,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   delete reqBody.temperature;
                   delete reqBody.top_p;
               }
-              const data = await safeFetchJson(`${baseUrl}/chat/completions`, {
-                  method: 'POST', headers,
-                  body: JSON.stringify(reqBody)
-              }, 2, 0, { appName: '消息', charId, charName: char.name, purpose: '主动消息' });
+               const data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                   method: 'POST', headers,
+                   body: JSON.stringify(reqBody)
+               }, 2, 0, { appName: '消息', charId, charName: char.name, purpose: externalWake ? '外部唤醒任务' : '主动消息' });
 
               // 5. Process & save response
               let aiContent = data.choices?.[0]?.message?.content || '';
@@ -2263,6 +2343,44 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           void runProactive(charId);
       });
 
+      let externalWakePoller: ReturnType<typeof createExternalWakePoller> | null = null;
+      let lastExternalWakeErrorAt = 0;
+      try {
+          const externalWakeConfig = loadExternalWakeClientConfig();
+          if (externalWakeConfig.enabled) {
+              externalWakePoller = createExternalWakePoller({
+                  adapterUrl: externalWakeConfig.adapterUrl,
+                  intervalMs: externalWakeConfig.intervalMs,
+                  onWake: (wake) => {
+                      const targetCharId = resolveExternalWakeCharacterId({
+                          wake,
+                          characters: charactersRef.current,
+                          storedCharId: loadExternalWakeTargetCharId() || externalWakeConfig.targetCharId,
+                          activeCharacterId: activeCharIdScheduleRef.current,
+                      });
+                      if (!targetCharId) {
+                          console.warn('[ExternalWake] Received wake but no target character is available', {
+                              id: wake.id,
+                              reason: wake.reason,
+                          });
+                          return;
+                      }
+                      void runProactive(targetCharId, { externalWake: wake });
+                  },
+                  onError: (error) => {
+                      const now = Date.now();
+                      if (now - lastExternalWakeErrorAt < 60_000) return;
+                      lastExternalWakeErrorAt = now;
+                      console.warn('[ExternalWake] Poll failed; waiting for local adapter', error);
+                  },
+              });
+              externalWakePoller.start();
+              console.log(`[ExternalWake] Listening on ${externalWakeConfig.adapterUrl}`);
+          }
+      } catch (error) {
+          console.warn('[ExternalWake] Disabled because configuration is invalid', error);
+      }
+
       // 「彼方」自主登入 —— 独立调度，复用同一批 refs 拿最新状态
       const runVR = async (charId: string, room?: string, letterId?: string) => {
           const char = charactersRef.current.find(c => c.id === charId);
@@ -2360,6 +2478,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       return () => {
           // Cleanup: detach proactive listeners when OSContext unmounts (unlikely but safe)
+          externalWakePoller?.stop();
           ProactiveChat.onTrigger(() => {});
           VRScheduler.onTrigger(() => {});
           WorldScheduler.onTrigger(() => {});

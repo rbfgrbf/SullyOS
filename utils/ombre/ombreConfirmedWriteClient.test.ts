@@ -10,8 +10,8 @@ const safeRequest = {
   meaning: 'User-approved memory from SullyOS chat.',
 } as const;
 
-function bodyForFirstCall(fetchImpl: any) {
-  const [, init] = fetchImpl.mock.calls[0];
+function bodyForCall(fetchImpl: any, index: number) {
+  const [, init] = fetchImpl.mock.calls[index];
   return JSON.parse(String(init.body));
 }
 
@@ -71,23 +71,46 @@ describe('Ombre confirmed write client', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('posts one mock JSON-RPC tools/call hold request without auth headers or test_data', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      result: { content: [{ type: 'text', text: '新建→5202cd96db58 未分类' }] },
-    }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  it('initializes MCP session before tools/call hold without auth headers or test_data', async () => {
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      if (body.method === 'initialize') {
+        return new Response(JSON.stringify({ result: { protocolVersion: '2024-11-05' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'session-123' },
+        });
+      }
+      if (body.method === 'notifications/initialized') {
+        return new Response('', { status: 202, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        result: { content: [{ type: 'text', text: '新建→5202cd96db58 未分类' }] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as any;
 
     const result = await callOmbreConfirmedHold('http://127.0.0.1:18001/mcp', safeRequest, fetchImpl);
-    const [, init] = fetchImpl.mock.calls[0];
-    const body = bodyForFirstCall(fetchImpl);
+    const initializeBody = bodyForCall(fetchImpl, 0);
+    const initializedBody = bodyForCall(fetchImpl, 1);
+    const holdBody = bodyForCall(fetchImpl, 2);
+    const [, initializedInit] = fetchImpl.mock.calls[1];
+    const [, holdInit] = fetchImpl.mock.calls[2];
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:18001/mcp');
-    expect(init.headers.Authorization).toBeUndefined();
-    expect(JSON.stringify(init.headers)).not.toMatch(/Bearer/i);
-    expect(body.method).toBe('tools/call');
-    expect(body.params.name).toBe('hold');
-    expect(body.params.arguments).toEqual(safeRequest);
-    expect(body.params.arguments).not.toHaveProperty('test_data');
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls.map(call => call[0])).toEqual([
+      'http://127.0.0.1:18001/mcp',
+      'http://127.0.0.1:18001/mcp',
+      'http://127.0.0.1:18001/mcp',
+    ]);
+    expect(JSON.stringify(fetchImpl.mock.calls.map(call => call[1].headers))).not.toMatch(/Bearer|Authorization/i);
+    expect(initializeBody.method).toBe('initialize');
+    expect(initializedBody.method).toBe('notifications/initialized');
+    expect(initializedBody).not.toHaveProperty('id');
+    expect((initializedInit.headers as Record<string, string>)['Mcp-Session-Id']).toBe('session-123');
+    expect((holdInit.headers as Record<string, string>)['Mcp-Session-Id']).toBe('session-123');
+    expect(holdBody.method).toBe('tools/call');
+    expect(holdBody.params.name).toBe('hold');
+    expect(holdBody.params.arguments).toEqual(safeRequest);
+    expect(holdBody.params.arguments).not.toHaveProperty('test_data');
     expect(result).toEqual({
       ok: true,
       bucketId: '5202cd96db58',

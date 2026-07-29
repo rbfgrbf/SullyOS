@@ -84,7 +84,7 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     });
 
     const result = await runOmbreConfirmedHoldWorkflow({
-      endpoint: 'http://127.0.0.1:18001/mcp',
+      endpoint: 'http://127.0.0.1:18001/mcp-workflow-success',
       readbackConfig: readbackConfig('http://workflow-success/mcp'),
       request,
       mappingAudit,
@@ -94,6 +94,7 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     const entries = loadOmbreConfirmedWriteAuditEntries(storage);
     const bodies = fetchImpl.mock.calls.map(([, init]) => JSON.parse(String(init.body)));
     const headers = fetchImpl.mock.calls.map(([, init]) => init.headers as Record<string, string>);
+    const holdBody = bodies.find(body => body.method === 'tools/call' && body.params?.name === 'hold');
 
     expect(result.ok).toBe(true);
     expect(result.readbackStatus).toBe('passed');
@@ -102,10 +103,12 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     expect(entries[0].status).toBe('written');
     expect(entries[0].readbackStatus).toBe('passed');
     expect(entries[0].dedupeTouchedMetadata).toBe(true);
-    expect(bodies[0].params.name).toBe('hold');
-    expect(bodies[0].params.arguments).not.toHaveProperty('test_data');
+    expect(bodies[0].method).toBe('initialize');
+    expect(bodies[1].method).toBe('notifications/initialized');
+    expect(holdBody?.params.arguments).not.toHaveProperty('test_data');
     expect(bodies.some(body => body.method === 'tools/call' && body.params?.name === 'breath_search')).toBe(true);
     expect(headers.every(header => header.Authorization === undefined)).toBe(true);
+    expect(headers.some(header => header['Mcp-Session-Id'] === 'workflow-session')).toBe(true);
     expect(JSON.stringify(headers)).not.toMatch(/Bearer/i);
   });
 
@@ -114,7 +117,7 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     const fetchImpl = workflowFetch({ writeOk: false });
 
     const result = await runOmbreConfirmedHoldWorkflow({
-      endpoint: 'http://127.0.0.1:18001/mcp',
+      endpoint: 'http://127.0.0.1:18001/mcp-workflow-write-failed',
       readbackConfig: readbackConfig('http://workflow-write-failed/mcp'),
       request,
       mappingAudit,
@@ -123,14 +126,17 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     });
     const entries = loadOmbreConfirmedWriteAuditEntries(storage);
     const bodies = fetchImpl.mock.calls.map(([, init]) => JSON.parse(String(init.body)));
+    const holdBody = bodies.find(body => body.method === 'tools/call' && body.params?.name === 'hold');
 
     expect(result.ok).toBe(false);
     expect(result.readbackStatus).toBe('not-run');
     expect(entries).toHaveLength(1);
     expect(entries[0].status).toBe('write-failed');
     expect(entries[0].readbackStatus).toBe('not-run');
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0].params.name).toBe('hold');
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].method).toBe('initialize');
+    expect(bodies[1].method).toBe('notifications/initialized');
+    expect(holdBody?.params.name).toBe('hold');
     expect(JSON.stringify(entries[0])).not.toContain('mock write failed');
   });
 
@@ -139,7 +145,7 @@ describe('runOmbreConfirmedHoldWorkflow', () => {
     const fetchImpl = workflowFetch({ writeOk: true, readbackText: 'different memory only' });
 
     const result = await runOmbreConfirmedHoldWorkflow({
-      endpoint: 'http://127.0.0.1:18001/mcp',
+      endpoint: 'http://127.0.0.1:18001/mcp-workflow-readback-failed',
       readbackConfig: readbackConfig('http://workflow-readback-failed/mcp'),
       request,
       mappingAudit,

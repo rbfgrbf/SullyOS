@@ -24,7 +24,8 @@ const DB_NAME = 'AetherOS_Data';
 // v67：两条并行线各自用掉了 v65/v66（A线: blob_assets + 生活记录；B线: room_plates 门牌 + digest_reports 消化日志），
 // 合并后统一推到 67——建表全部走幂等的 if(!contains)，任一侧的 v66 老库升级时都会补齐缺的那组表。
 // v68：character_groups 角色分组（神经链接"文件夹"，见 types.ts CharacterGroup）。
-const DB_VERSION = 68;
+// v69：Ombre 分段摘要本地任务队列（只保存 checkpoint，不保存原始消息或密钥）。
+const DB_VERSION = 70;
 
 const STORE_CHARACTERS = 'characters';
 const STORE_CHAR_GROUPS = 'character_groups'; // 角色分组定义（角色通过 groupId 指向；与群聊 groups 无关）
@@ -78,6 +79,8 @@ const STORE_WORLD_EPISODES = 'world_episodes';    // 家园·演绎历史（每�
 const STORE_LIFE_RECORDS = 'life_records';        // 生活记录：生理期/药盒打卡/锻炼（记账走 bank_transactions）
 const STORE_MED_PLANS = 'med_plans';              // 药盒计划（每天几点吃什么药）
 const STORE_LIFE_SETTINGS = 'life_record_settings'; // 生活记录设置单例（id='main'：周期长度等）
+const STORE_OMBRE_DIGEST_JOBS = 'ombre_digest_jobs'; // Ombre 分段摘要本地 checkpoint 队列
+const STORE_OMBRE_DIGEST_STAGE_ACTIONS = 'ombre_digest_stage_actions'; // Ombre 本地临时动作池
 
 // API 调用记录：保留近 5 天，超期丢弃；再加一个硬上限防止异常情况撑爆
 const API_CALL_LOG_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000;
@@ -338,6 +341,36 @@ export const openDB = (): Promise<IDBDatabase> => {
       }
       createStore(STORE_MED_PLANS, { keyPath: 'id' });
       createStore(STORE_LIFE_SETTINGS, { keyPath: 'id' });
+
+      if (!db.objectStoreNames.contains(STORE_OMBRE_DIGEST_JOBS)) {
+          const digestStore = db.createObjectStore(STORE_OMBRE_DIGEST_JOBS, { keyPath: 'id' });
+          digestStore.createIndex('charId', 'charId', { unique: false });
+          digestStore.createIndex('status', 'status', { unique: false });
+          digestStore.createIndex('charId_status', ['charId', 'status'], { unique: false });
+          digestStore.createIndex('sourceEndMessageId', 'sourceEndMessageId', { unique: false });
+      } else {
+          const digestStore = (event.target as IDBOpenDBRequest).transaction?.objectStore(STORE_OMBRE_DIGEST_JOBS);
+          if (digestStore) {
+              for (const [name, keyPath] of [
+                  ['charId', 'charId'],
+                  ['status', 'status'],
+                  ['charId_status', ['charId', 'status']],
+                  ['sourceEndMessageId', 'sourceEndMessageId'],
+              ] as const) {
+                  if (!digestStore.indexNames.contains(name)) {
+                      try { digestStore.createIndex(name, keyPath, { unique: false }); } catch { /* 已存在或旧库不兼容时保留原表 */ }
+                  }
+              }
+          }
+      }
+
+      if (!db.objectStoreNames.contains(STORE_OMBRE_DIGEST_STAGE_ACTIONS)) {
+          const stageStore = db.createObjectStore(STORE_OMBRE_DIGEST_STAGE_ACTIONS, { keyPath: 'id' });
+          stageStore.createIndex('charId', 'charId', { unique: false });
+          stageStore.createIndex('charId_signature', ['charId', 'signature'], { unique: false });
+          stageStore.createIndex('charId_localDate', ['charId', 'localDate'], { unique: false });
+          stageStore.createIndex('expiresAt', 'expiresAt', { unique: false });
+      }
 
       createStore(STORE_HOTNEWS, { keyPath: 'id' });
 

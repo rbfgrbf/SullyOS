@@ -11,7 +11,8 @@
     "cap:android": "cap open android",
     "build:workers": "node scripts/build-workers.mjs",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "test:ombre-digest-bridge": "node --test scripts/ombre-digest-bridge.test.mjs"
   },
   "dependencies": {
     "@capacitor-community/speech-recognition": "^6.0.1",
