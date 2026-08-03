@@ -2140,7 +2140,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       ? char.emotionConfig.api
                       : { baseUrl: apiConfigRef.current.baseUrl, apiKey: apiConfigRef.current.apiKey, model: apiConfigRef.current.model };
                   if (emotionApi.baseUrl && currentUserProfile) {
-                      evaluateEmotionBackground(char, currentUserProfile, systemPrompt, apiMessages, emotionApi)
+                      evaluateEmotionBackground(char, currentUserProfile, systemPrompt, apiMessages, emotionApi, payload.promptControl)
                           .then((innerState) => {
                               if (innerState) proactiveInnerStateRef.current.set(charId, innerState);
                           })
@@ -2170,7 +2170,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               const data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                   method: 'POST', headers,
                   body: JSON.stringify(reqBody)
-              }, 2, 0, { appName: '消息', charId, charName: char.name, purpose: '主动消息' });
+              }, 2, 0, { appName: '消息', charId, charName: char.name, purpose: '主动消息', promptControl: payload.promptControl });
 
               // 5. Process & save response
               let aiContent = data.choices?.[0]?.message?.content || '';

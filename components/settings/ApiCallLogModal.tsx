@@ -164,14 +164,19 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                     {entries.map((e) => {
                         const { day, time } = formatTime(e.timestamp);
                         const hasBreakdown = !!e.promptBreakdown?.length;
+                        const hasPromptControl = !!e.promptControl?.modules?.length;
+                        const canExpand = hasBreakdown || hasPromptControl;
                         const expanded = expandedId === e.id;
                         return (
                             <div
                                 key={e.id}
-                                onClick={hasBreakdown ? () => { if (!expanded) trackEvent('展开单条输入构成'); setExpandedId(expanded ? null : e.id); } : undefined}
+                                onClick={canExpand ? () => {
+                                    if (!expanded) trackEvent(hasPromptControl ? '展开单条 Prompt 审计' : '展开单条输入构成');
+                                    setExpandedId(expanded ? null : e.id);
+                                } : undefined}
                                 className={`rounded-2xl border p-3 ${
                                     e.ok ? 'bg-white/70 border-slate-200/60' : 'bg-rose-50/60 border-rose-200/60'
-                                } ${hasBreakdown ? 'cursor-pointer active:scale-[0.99] transition-transform' : ''}`}
+                                } ${canExpand ? 'cursor-pointer active:scale-[0.99] transition-transform' : ''}`}
                             >
                                 <div className="flex items-center justify-between gap-2 mb-1.5">
                                     <div className="flex items-center gap-1.5 min-w-0">
@@ -225,13 +230,18 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                                         </div>
                                     )}
                                 </div>
-                                {hasBreakdown && (
+                                {canExpand && (
                                     <div className="mt-1.5 text-[10px] text-slate-300 select-none">
-                                        {expanded ? '▲ 收起输入构成' : '▼ 点击查看输入构成（哪块占了多少）'}
+                                        {expanded ? '▲ 收起本轮审计' : '▼ 点击查看本轮审计'}
                                     </div>
                                 )}
-                                {expanded && e.promptBreakdown && (
-                                    <PromptBreakdownView blocks={e.promptBreakdown} promptTokens={e.promptTokens} />
+                                {expanded && (
+                                    <div className="space-y-3">
+                                        {e.promptControl && <PromptControlView snapshot={e.promptControl} />}
+                                        {e.promptBreakdown && (
+                                            <PromptBreakdownView blocks={e.promptBreakdown} promptTokens={e.promptTokens} />
+                                        )}
+                                    </div>
                                 )}
                             </div>
                         );
@@ -284,6 +294,34 @@ const PromptBreakdownView: React.FC<{ blocks: PromptBlockStat[]; promptTokens?: 
                     </div>
                 );
             })}
+        </div>
+    );
+};
+
+const PromptControlView: React.FC<{ snapshot: NonNullable<ApiCallLogEntry['promptControl']> }> = ({ snapshot }) => {
+    const includedCount = snapshot.modules.filter(module => module.included).length;
+    const disabledCount = snapshot.disabledKeys.length;
+    return (
+        <div className="mt-2 pt-2 border-t border-slate-100" onClick={(ev) => ev.stopPropagation()}>
+            <div className="flex items-baseline justify-between gap-2">
+                <span className="text-[10px] font-bold text-slate-400">Prompt 模块</span>
+                <span className="text-[9px] text-slate-400">
+                    已注入 {includedCount}/{snapshot.modules.length}
+                    {disabledCount > 0 ? ` · 已关闭 ${disabledCount}` : ''}
+                </span>
+            </div>
+            <div className="mt-1.5 grid grid-cols-1 gap-1">
+                {snapshot.modules.map(module => (
+                    <div key={module.key} className="flex items-center justify-between gap-2 text-[10px]">
+                        <span className={module.included ? 'text-emerald-600' : 'text-slate-400'}>
+                            {module.included ? '已注入' : module.enabled ? '未注入' : '已关闭'} · {module.label}
+                        </span>
+                        {module.note && (
+                            <span className="text-slate-300 text-right truncate" title={module.note}>{module.note}</span>
+                        )}
+                    </div>
+                ))}
+            </div>
         </div>
     );
 };

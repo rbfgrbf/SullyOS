@@ -40,6 +40,7 @@ import { ChatPrompts } from './chatPrompts';
 import { DB } from './db';
 
 const TEST_USER_ID = '3f2b1c8a-9d4e-4a1b-8c2d-000000000001';
+const PROMPT_CONTROL_STORAGE_KEY = 'sullyos.promptControl.v1';
 
 // cancelTask 要走 ensureWorkerReady（读 IndexedDB 里的 worker 地址），测里给一份固定配置。
 vi.mock('./activeMsgStore', () => ({
@@ -230,7 +231,10 @@ describe('连接失败的归类（AmsgFailKind）', () => {
 // 一条都留不下。要是照直返回空数组，面板会把该角色的任务全标成「远端不存在」，
 // 「关闭 2.0」也会以为没什么要取消——两处都是拿半份证据下结论。
 describe('ActiveMsgClient.listRemoteTaskUuidsForChar', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
+  afterEach(() => {
+    localStorage.removeItem(PROMPT_CONTROL_STORAGE_KEY);
+    vi.restoreAllMocks();
+  });
 
   it('worker 有投影 → 只留本角色的 uuid', async () => {
     vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([
@@ -259,7 +263,10 @@ describe('ActiveMsgClient.listRemoteTaskUuidsForChar', () => {
 // 回归守卫：删角色 / 关闭 2.0 都要把该角色的远端任务清干净——worker 上的任务不随本地
 // 删除消失，留着会到点照跑一整轮生成 + 推送（角色都没了还在发消息，每次真烧一轮 LLM）。
 describe('ActiveMsgClient.cancelAllTasksForChar', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
+  afterEach(() => {
+    localStorage.removeItem(PROMPT_CONTROL_STORAGE_KEY);
+    vi.restoreAllMocks();
+  });
 
   it('以远端清单为准（本地漏掉的「已过点未消费」任务也要取消到）', async () => {
     vi.spyOn(ActiveMsgClient, 'listRemoteTaskUuidsForChar').mockResolvedValue(['remote-1', 'remote-2']);
@@ -515,7 +522,10 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
     vi.spyOn(ChatPrompts, 'buildMessageHistory').mockReturnValue({ apiMessages: [] } as any);
     vi.spyOn(ChatPrompts, 'filterVisibleEmojis').mockReturnValue({ emojis: [], categories: [] } as any);
   });
-  afterEach(() => { vi.restoreAllMocks(); });
+  afterEach(() => {
+    localStorage.removeItem(PROMPT_CONTROL_STORAGE_KEY);
+    vi.restoreAllMocks();
+  });
 
   const pack = (char: any) => buildFirePack(char, user, [], undefined, { all: [], categories: [] });
 
@@ -535,7 +545,61 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
     // 第 12 个位置参数是 promptOptions（见 chatPrompts.buildSystemPrompt 签名）。
     // 这个开关一次性关掉时间块 / 真实世界感知 / 日程 / 音乐 / 刚打完电话 / 群聊相对时间 /
     // 生活记录代记 / [schedule_message] 教学，清单见 ChatPrompts.PromptBuildOptions。
-    expect(systemPromptSpy.mock.calls[0][11]).toEqual({ forFirePack: true });
+    expect(systemPromptSpy.mock.calls[0][11]).toMatchObject({
+      forFirePack: true,
+      promptControls: {
+        coreIdentity: true,
+        timeAwareness: true,
+        realtimeState: true,
+      },
+    });
+  });
+
+  it('buildSystemPrompt 收到 promptControls —— 主动消息打包不绕过每轮 prompt 控制', async () => {
+    localStorage.setItem(PROMPT_CONTROL_STORAGE_KEY, JSON.stringify({
+      modules: {
+        coreIdentity: false,
+        memoryPalace: false,
+        realtimeState: false,
+        timeAwareness: false,
+      },
+    }));
+
+    await pack(baseChar());
+
+    expect(systemPromptSpy).toHaveBeenCalledTimes(1);
+    expect(systemPromptSpy.mock.calls[0][11]).toMatchObject({
+      forFirePack: true,
+      promptControls: {
+        coreIdentity: false,
+        memoryPalace: false,
+        realtimeState: false,
+        timeAwareness: false,
+      },
+    });
+  });
+
+  it('同步云端状态时 tool_pack 也按 Prompt 控制关闭时间感知', async () => {
+    vi.useRealTimers();
+    localStorage.setItem(PROMPT_CONTROL_STORAGE_KEY, JSON.stringify({
+      modules: {
+        timeAwareness: false,
+      },
+    }));
+    reiClient.init.mockReset().mockResolvedValue(undefined);
+    reiClient.putClientState.mockReset().mockResolvedValue({ success: true });
+
+    await ActiveMsgClient.syncCharFirePacks([{
+      char: baseChar({ timeAwarenessEnabled: true }),
+      config: { enabled: true } as any,
+      userProfile: user,
+      groups: [],
+      realtimeConfig: undefined,
+    }]);
+
+    const entries = reiClient.putClientState.mock.calls[0][0];
+    const toolPackEntry = entries.find((entry: any) => entry.key === 'tool_pack');
+    expect(JSON.parse(toolPackEntry.value).timeAwarenessEnabled).toBe(false);
   });
 
   it('当前时间槽位保留：worker 到点现算填入（1.0 提示块的「现在是」也是槽位）', async () => {

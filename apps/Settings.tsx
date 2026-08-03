@@ -28,6 +28,7 @@ import VersionInfo from '../components/settings/VersionInfo';
 import { LoyalUserRecruitmentController } from '../components/LoyalUserRecruitmentEvent';
 import { isPushVapidReady } from '../utils/pushVapid';
 import ApiCallLogModal from '../components/settings/ApiCallLogModal';
+import PromptControlSettings from '../components/settings/PromptControlSettings';
 import { DB } from '../utils/db';
 import { getBackupReminderState, setBackupReminderIntervalDays, daysSinceLastBackup, BACKUP_REMINDER_MIN_DAYS, BACKUP_REMINDER_MAX_DAYS } from '../utils/backupReminder';
 import { bucketRetryCount, isAnalyticsConfigured, isAnalyticsEnabled, setAnalyticsEnabled, trackEvent } from '../utils/analytics';
@@ -459,6 +460,9 @@ const Settings: React.FC = () => {
   const [cloudBackupFiles, setCloudBackupFiles] = useState<import('../types').CloudBackupFile[]>([]);
   const [cloudTestResult, setCloudTestResult] = useState<string>('');
   const [cloudTesting, setCloudTesting] = useState(false);
+  const handlePromptControlChange = useCallback(() => {
+      syncAmsgToolConfigAndPrompts(realtimeConfig, { characters, userProfile, groups });
+  }, [realtimeConfig, characters, userProfile, groups]);
 
   // 「该备份啦」提醒频率（1~30 天）。改动即落 localStorage（backupReminder 模块自管持久化）。
   const [backupReminderDays, setBackupReminderDays] = useState<number>(() => getBackupReminderState().intervalDays);
@@ -1972,6 +1976,8 @@ const Settings: React.FC = () => {
                 )}
             </div>
         </SettingsSection>
+
+        <PromptControlSettings onConfigChange={handlePromptControlChange} />
 
         {/* API 调用记录入口 — 点开看最近 5 天各 App / 角色 / 用途的调用明细 */}
         <button

@@ -4734,6 +4734,11 @@ var getProxyWorkerUrl = () => {
 var AMSG_TOOL_PACK_KEY = "tool_pack";
 var AMSG_GLOBAL_NAMESPACE = "amsg:global";
 var AMSG_TOOL_CONFIG_KEY = "tool_config";
+var normalizeAmsgToolPromptControls = (value) => ({
+  mcpTools: value?.mcpTools !== false,
+  realtimeState: value?.realtimeState !== false,
+  timeAwareness: value?.timeAwareness !== false
+});
 var parseToolPack = (value) => {
   try {
     const parsed = JSON.parse(value);
@@ -4764,6 +4769,7 @@ var parseToolConfig = (value) => {
       delete parsed.mcpServers;
       delete parsed.mcpUseNativeTools;
     }
+    parsed.promptControls = normalizeAmsgToolPromptControls(parsed.promptControls);
     return parsed;
   } catch {
     return null;
@@ -8660,7 +8666,11 @@ var amsgHooks = {
     if (!toolPack) throw fail("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const toolConfig = parseToolConfig(toolConfigRow.value);
     if (!toolConfig) throw fail("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
-    const mcpServers = filterMcpServersForChar(toolConfig.mcpServers, charId);
+    const promptControls = toolConfig.promptControls;
+    const mcpEnabled = promptControls?.mcpTools !== false;
+    const realtimeStateEnabled = promptControls?.realtimeState !== false;
+    const timeAwarenessEnabled = toolPack.timeAwarenessEnabled && promptControls?.timeAwareness !== false;
+    const mcpServers = mcpEnabled ? filterMcpServersForChar(toolConfig.mcpServers, charId) : [];
     const mcpResolve = mcpServers.length ? buildMcpNameMap(mcpServers, { maxNameLen: MCP_FIRE_NAME_BUDGET }) : null;
     const mcpNative = toolConfig.mcpUseNativeTools !== false;
     const storedSelfLog = parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? "");
@@ -8701,15 +8711,15 @@ var amsgHooks = {
       tzId: pack.tzId,
       excludeClientTaskId: clientTaskId || void 0
     });
-    const realtimeWorldBlock = await buildRealtimeWorldBlock({
+    const realtimeWorldBlock = realtimeStateEnabled ? await buildRealtimeWorldBlock({
       toolConfig,
-      timeAwarenessEnabled: toolPack.timeAwarenessEnabled,
+      timeAwarenessEnabled,
       tzId: pack.tzId,
       nowMs: ctx.now.getTime(),
       globalRows,
       globalNamespace: AMSG_GLOBAL_NAMESPACE,
       writeState: ctx.writeState
-    });
+    }) : "";
     const prompt = renderFirePack(pack, ctx.now.getTime(), taskMeta.amsgTaskInstruction, {
       selfLog,
       taskListBlock,

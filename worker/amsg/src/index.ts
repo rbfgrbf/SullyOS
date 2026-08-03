@@ -897,7 +897,11 @@ export const amsgHooks = {
     // 不存在「教了角色用、凭据却没到」的窗口。charIds 过滤与前台同语义。
     // mcpUseNativeTools=false = 用户的中转拒 tools（前台兼容模式同款开关），
     // 请求不带 tools 参数、提示词块教正文协议，识别走 processLLMRound 第二层。
-    const mcpServers = filterMcpServersForChar(toolConfig.mcpServers, charId);
+    const promptControls = toolConfig.promptControls;
+    const mcpEnabled = promptControls?.mcpTools !== false;
+    const realtimeStateEnabled = promptControls?.realtimeState !== false;
+    const timeAwarenessEnabled = toolPack.timeAwarenessEnabled && promptControls?.timeAwareness !== false;
+    const mcpServers = mcpEnabled ? filterMcpServersForChar(toolConfig.mcpServers, charId) : [];
     // 暴露名后面要拼 MCP_FIRE_NAME_PREFIX，长度预算得先把前缀那几个字符扣掉。
     const mcpResolve = mcpServers.length
       ? buildMcpNameMap(mcpServers, { maxNameLen: MCP_FIRE_NAME_BUDGET })
@@ -964,15 +968,17 @@ export const amsgHooks = {
 
     // 「外面的世界此刻什么样」：今日节日 + 实时天气 + 热搜，到点现拉现填。
     // 拉不到 / 超时都只是返回空串，那一段整个消失，这次触发照常往下走。
-    const realtimeWorldBlock = await buildRealtimeWorldBlock({
-      toolConfig,
-      timeAwarenessEnabled: toolPack.timeAwarenessEnabled,
-      tzId: pack.tzId,
-      nowMs: ctx.now.getTime(),
-      globalRows,
-      globalNamespace: AMSG_GLOBAL_NAMESPACE,
-      writeState: ctx.writeState,
-    });
+    const realtimeWorldBlock = realtimeStateEnabled
+      ? await buildRealtimeWorldBlock({
+          toolConfig,
+          timeAwarenessEnabled,
+          tzId: pack.tzId,
+          nowMs: ctx.now.getTime(),
+          globalRows,
+          globalNamespace: AMSG_GLOBAL_NAMESPACE,
+          writeState: ctx.writeState,
+        })
+      : '';
 
     // fire_pack v3：「本次任务」指令随任务 metadata 走，这里填槽。
     // MCP 块拼在渲染好的 prompt 之后（同一条 user 消息）。

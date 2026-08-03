@@ -51,9 +51,11 @@ import {
   AMSG_TOOL_PACK_KEY,
   buildToolConfig,
   buildToolPack,
+  type AmsgToolPromptControls,
 } from './amsgToolPack';
 import { listRecallableMonths } from './agenticTools';
 import { ChatPrompts } from './chatPrompts';
+import { defaultRealtimeConfig } from './realtimeContext';
 import { nowInTimeZone, resolveCharTimeZone, tzAwarenessNote } from './timezone';
 import { DB } from './db';
 import { copyWorkerBundleToClipboard } from './instantPushClient';
@@ -61,6 +63,12 @@ import { collectMcpFireServers, getMcpUseNativeTools } from './mcpClient';
 import { safeResponseJson } from './safeApi';
 import { ActiveMsgStore } from './activeMsgStore';
 import { KeepAlive } from './keepAlive';
+import {
+  getCoreContextPromptControls,
+  isPromptControlModuleEnabled,
+  readPromptControlConfig,
+  type PromptControlModuleKey,
+} from './promptControl';
 import {
   bytesToB64u,
   describePushCapabilityGap,
@@ -283,6 +291,44 @@ const buildLegacyStyleProactiveHint = (targetName: string, includeTime: boolean)
   ].join('\n');
 };
 
+function withPromptModuleDisabledChar(char: CharacterProfile, disabled: Set<PromptControlModuleKey>): CharacterProfile {
+  if (disabled.size === 0) return char;
+  const next: CharacterProfile = { ...char };
+  if (disabled.has('memoryPalace')) {
+    (next as any).memoryPalaceEnabled = false;
+    (next as any).memoryPalaceInjection = '';
+    (next as any).roomPlatesInjection = '';
+  }
+  if (disabled.has('worldbook')) {
+    (next as any).mountedWorldbooks = [];
+  }
+  if (disabled.has('timeAwareness')) {
+    (next as any).timeAwarenessEnabled = false;
+  }
+  if (disabled.has('realtimeState')) {
+    (next as any).scheduleFeatureEnabled = false;
+    (next as any).emotionConfig = { ...((char as any).emotionConfig || {}), enabled: false };
+    (next as any).buffInjection = '';
+    (next as any).activeBuffs = [];
+  }
+  return next;
+}
+
+const readAmsgToolPromptControls = (): AmsgToolPromptControls => {
+  const config = readPromptControlConfig();
+  return {
+    mcpTools: isPromptControlModuleEnabled('mcpTools', config),
+    realtimeState: isPromptControlModuleEnabled('realtimeState', config),
+    timeAwareness: isPromptControlModuleEnabled('timeAwareness', config),
+  };
+};
+
+function keepCurrentUserTurn<T extends { role?: string }>(messages: T[]): T[] {
+  const idx = [...messages].reverse().findIndex(m => m.role === 'user');
+  if (idx < 0) return messages.slice(-1);
+  return [messages[messages.length - 1 - idx]];
+}
+
 // 拼出带时间槽位的完整 prompt 模板（fire_pack）：原样 putClientState 上云，
 // worker 到点用 renderFirePack 填槽（所以上下文永远是最后一次聊天的状态）。
 /**
@@ -304,20 +350,36 @@ export const buildFirePack = async (
   realtimeConfig: RealtimeConfig | undefined,
   emojiLibrary?: EmojiLibrary,
 ): Promise<AmsgFirePack> => {
+  const promptControlConfig = readPromptControlConfig();
+  const moduleEnabled = (key: PromptControlModuleKey) => isPromptControlModuleEnabled(key, promptControlConfig);
+  const disabledModuleKeys = new Set<PromptControlModuleKey>(
+    ([
+      'memoryPalace',
+      'worldbook',
+      'timeAwareness',
+      'realtimeState',
+    ] as PromptControlModuleKey[]).filter(key => !moduleEnabled(key)),
+  );
+  const promptChar = withPromptModuleDisabledChar(char, disabledModuleKeys);
+  const corePromptControls = getCoreContextPromptControls(promptControlConfig);
+  const effectiveRealtimeConfig: RealtimeConfig | undefined = moduleEnabled('realtimeState')
+    ? realtimeConfig
+    : (defaultRealtimeConfig as unknown as RealtimeConfig);
   const [{ recentMessages, lastUserMessageAt }, library, schedule] = await Promise.all([
-    buildTimeGapHint(char.id),
+    buildTimeGapHint(promptChar.id),
     emojiLibrary ? Promise.resolve(emojiLibrary) : readEmojiLibrary(),
     // 日程随包带原始表（不是渲染好的文字），worker 到点自己挑时段。总开关关掉的角色没有表。
-    isScheduleFeatureOn(char)
-      ? getDailyScheduleForChar(char).catch((e) => {
-          console.warn('[ActiveMsg2] 日程读取失败，这次不带作息表', char.id, e);
+    moduleEnabled('realtimeState') && isScheduleFeatureOn(promptChar)
+      ? getDailyScheduleForChar(promptChar).catch((e) => {
+          console.warn('[ActiveMsg2] 日程读取失败，这次不带作息表', promptChar.id, e);
           return null;
         })
       : Promise.resolve(null),
   ]);
+  const recentMessagesForPrompt = moduleEnabled('chatHistory') ? recentMessages : keepCurrentUserTurn(recentMessages);
   // 角色的时间参照系：开了自定义时区用角色的，没开用设备的。worker 渲染一切给角色看的
   // 时间（当前时间、日程日期、排程清单）都按它来。
-  const charTz = resolveCharTimeZone(char);
+  const charTz = resolveCharTimeZone(promptChar);
   const tzId = charTz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   // 用户设备自己的钟。跟 tzId 分开存：角色排消息时得知道「对方那边现在几点」，
   // 不然异国恋角色会把「晚上聊两句」排到用户的凌晨三点，而且没有任何线索能让它避开。
@@ -326,12 +388,12 @@ export const buildFirePack = async (
   // （buildTimeAwarenessBlock 直接返回空串），主动消息这边却精确报出年月日 + 星期，
   // 是同一个开关的两套行为。关掉时这几行连槽位一起不进模板。
   // 排程工具的 send_at 说明不受影响（那份在 amsgFireSchedule）：排时间本来就得知道现在几点。
-  const timeAware = char.timeAwarenessEnabled !== false;
+  const timeAware = moduleEnabled('timeAwareness') && promptChar.timeAwarenessEnabled !== false;
   // 只摘渲染会读到的字段：整份日程里还挂着每个时段缓存的小剧场台词和看板图，
   // 带上去只是白占云端状态的体积（fire_pack 本来就有几万字）。
   const scene: AmsgFireScene | null = schedule
     ? {
-        charId: char.id,
+        charId: promptChar.id,
         // 这份表是角色当地「今天」的安排，到点先比日期再用（见 renderFireSceneBlock）。
         dateKey: getLocalDateKey(nowInTimeZone(tzId)),
         schedule: {
@@ -345,10 +407,14 @@ export const buildFirePack = async (
           })),
           ...(schedule.flowNarrative ? { flowNarrative: schedule.flowNarrative } : {}),
         },
-        songPool: buildSongPool(char).map((s) => ({ id: s.id, name: s.name, artists: s.artists })),
+        songPool: moduleEnabled('musicState')
+          ? buildSongPool(promptChar).map((s) => ({ id: s.id, name: s.name, artists: s.artists }))
+          : [],
       }
     : null;
   const legacyHint = buildLegacyStyleProactiveHint(userProfile.name || '对方', timeAware);
+  const sceneSlot = moduleEnabled('realtimeState') ? AMSG_SLOT_SCENE : '';
+  const realtimeWorldSlot = moduleEnabled('realtimeState') ? AMSG_SLOT_REALTIME_WORLD : '';
   // 前台每轮都注入的时差说明（「你身处 X 时区……对方可能在不同时区」）。它是静态文案、
   // 不随时间变，所以打包时就烤进模板；到点由 AMSG_SLOT_USER_CLOCK 补上「对方那边现在
   // 几点」。fire 侧的角色设定是 skipTimeAwareness 建的，整块时间感知都被抹掉了，
@@ -359,41 +425,41 @@ export const buildFirePack = async (
   const { emojis, categories } = ChatPrompts.filterVisibleEmojis(
     library.all,
     library.categories,
-    char.id,
+    promptChar.id,
   );
   const systemPrompt = await ChatPrompts.buildSystemPrompt(
-    char,
+    promptChar,
     userProfile,
     groups,
     emojis,
     categories,
-    recentMessages,
-    realtimeConfig,
+    recentMessagesForPrompt,
+    effectiveRealtimeConfig,
     undefined,
     undefined,
     undefined,
     undefined,
     // 模板是现在打好、到点才渲染的，凡是「打包这一刻」的状态都不烤进去。
     // 具体拿掉哪些块、到点由谁补，见 ChatPrompts.PromptBuildOptions 上的表。
-    { forFirePack: true },
+    { forFirePack: true, promptControls: corePromptControls },
   );
   const { apiMessages } = ChatPrompts.buildMessageHistory(
-    recentMessages,
-    Math.min(char.contextLimit || 120, 120),
-    char,
+    recentMessagesForPrompt,
+    moduleEnabled('chatHistory') ? Math.min(promptChar.contextLimit || 120, 120) : 1,
+    promptChar,
     userProfile,
     emojis,
   );
 
   const recentTranscript = apiMessages
     .slice(-30)
-    .map((message) => formatHistoryLine(message.role, message.content, char, userProfile))
+    .map((message) => formatHistoryLine(message.role, message.content, promptChar, userProfile))
     .join('\n\n');
 
   // 记忆库里有哪些月份查得到 —— 提示词一直在教角色用 [[RECALL: 年-月]]，却没说过
   // 哪些月份有东西。不报菜单的话它多半不查，直接凭空编一段「回忆」出来。
   // 只写进下面这段主动消息自己的规则里，不动 chatPrompts 那条所有角色每轮都走的主链路。
-  const recallableMonths = listRecallableMonths(char.memories);
+  const recallableMonths = moduleEnabled('nativeActiveMemory') ? listRecallableMonths(promptChar.memories) : [];
   const recallHint = recallableMonths.length > 0
     ? `- 你的记忆库里存着这些月份的经历：${recallableMonths.join('、')}。想聊起其中某段时，先输出 [[RECALL: 年-月]] 把细节取回来再写，别凭印象编。`
     : null;
@@ -427,15 +493,15 @@ export const buildFirePack = async (
     ...(timeAware
       ? [
           '【当前时刻补充】',
-          `当前本地时间（你所在地）：${AMSG_SLOT_CURRENT_TIME}${tzNote ? `\n${tzNote}` : ''}${AMSG_SLOT_USER_CLOCK}${AMSG_SLOT_SCENE}`,
+          `当前本地时间（你所在地）：${AMSG_SLOT_CURRENT_TIME}${tzNote ? `\n${tzNote}` : ''}${AMSG_SLOT_USER_CLOCK}${sceneSlot}`,
         ]
       // 关了时间感知的架空角色：整段只剩「你在做什么 / 外面什么样」，一个钟都不给。
-      : [`【当前时刻补充】${AMSG_SLOT_SCENE}`]),
+      : [`【当前时刻补充】${sceneSlot}`]),
     // 排程清单跟在时间后面：它整段都在讲「几点会发生什么」，挨着当前时刻读才对得上。
     // 没有待触发任务时 worker 填空串，这一行连带消失。
     // 最后是「外面的世界此刻什么样」（节日 / 天气 / 热搜）：跟时间同属「此刻的读数」，
     // 一样由 worker 到点现拉现填，拉不到就整段消失。
-    `${timeAware ? AMSG_SLOT_TIME_SINCE_USER : ''}${AMSG_SLOT_TASK_LIST}${AMSG_SLOT_REALTIME_WORLD}`,
+    `${timeAware ? AMSG_SLOT_TIME_SINCE_USER : ''}${AMSG_SLOT_TASK_LIST}${realtimeWorldSlot}`,
     '',
     legacyHint,
     '',
@@ -444,7 +510,7 @@ export const buildFirePack = async (
     '',
     // recency 末位人声锚：上面【角色系统设定】里已带「回到你自己」钢印，但被任务说明压在后面、
     // 失了 recency。这里在最后一句把它拎回来，让主动消息也从「你这个人」长出来，而不是滑回均值腔。
-    `（开口前回到你自己：这条得是 ${char.name} 会发的那一条——语气、用词、节奏都只属于你。哪怕只是随口一句，也要是你。）`,
+    `（开口前回到你自己：这条得是 ${promptChar.name} 会发的那一条——语气、用词、节奏都只属于你。哪怕只是随口一句，也要是你。）`,
   ].join('\n');
 
   return {
@@ -461,7 +527,7 @@ export const buildFirePack = async (
     builtAt: Date.now(),
     // 到点时角色要知道自己还挂着什么，才不会把同一件事再排一遍。这里带原始记录，
     // 渲染成人话由 worker 现场做（时间要按 tzId 换算，且得摘掉正在发的那条）。
-    pendingTasks: getPendingTasks(char.activeMsg2Config, Date.now()),
+    pendingTasks: getPendingTasks(promptChar.activeMsg2Config, Date.now()),
     // 「此刻在做什么」也带原始素材：整天的作息表 + 歌单抽样池，worker 到点按 tzId
     // 挑当前时段。烤成文字的话，凌晨三点触发时角色会说「我在健身房呢」。
     scene,
@@ -607,6 +673,7 @@ const buildCharStateEntries = async (
   char: CharacterProfile,
   firePack: AmsgFirePack,
   updatedAt: number,
+  promptControls: AmsgToolPromptControls = readAmsgToolPromptControls(),
 ) => [
   {
     namespace: amsgStateNamespace(char.id),
@@ -619,7 +686,7 @@ const buildCharStateEntries = async (
   {
     namespace: amsgStateNamespace(char.id),
     key: AMSG_TOOL_PACK_KEY,
-    value: await packStateValue(JSON.stringify(buildToolPack(char))),
+    value: await packStateValue(JSON.stringify(buildToolPack(char, promptControls))),
     updatedAt,
   },
 ];
@@ -628,17 +695,20 @@ const buildCharStateEntries = async (
 const buildToolConfigEntry = (
   realtimeConfig: RealtimeConfig | undefined,
   updatedAt: number,
-) => ({
-  namespace: AMSG_GLOBAL_NAMESPACE,
-  key: AMSG_TOOL_CONFIG_KEY,
-  // MCP 配置在这里现读现带：三条上传路径（排程 / fire_pack 冲刷 / 设置保存）
-  // 全走这个咽喉，不会出现某条路漏带的版本分叉。
-  value: JSON.stringify(buildToolConfig(realtimeConfig, {
-    servers: collectMcpFireServers(),
-    useNativeTools: getMcpUseNativeTools(),
-  })),
-  updatedAt,
-});
+) => {
+  const promptControls = readAmsgToolPromptControls();
+  return {
+    namespace: AMSG_GLOBAL_NAMESPACE,
+    key: AMSG_TOOL_CONFIG_KEY,
+    // MCP 配置在这里现读现带：三条上传路径（排程 / fire_pack 冲刷 / 设置保存）
+    // 全走这个咽喉，不会出现某条路漏带的版本分叉。
+    value: JSON.stringify(buildToolConfig(realtimeConfig, {
+      servers: promptControls.mcpTools ? collectMcpFireServers() : [],
+      useNativeTools: getMcpUseNativeTools(),
+    }, promptControls)),
+    updatedAt,
+  };
+};
 
 /**
  * 现有推送订阅还能不能继续用；不能用的当场退订，返回 null 让调用方重新订阅。

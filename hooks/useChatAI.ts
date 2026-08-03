@@ -58,6 +58,7 @@ import {
     getMemoryPalaceHighWaterMarkForContext,
     loadCharacterContextRange,
 } from '../utils/chatContextRange';
+import type { PromptControlSnapshot } from '../utils/promptControl';
 
 // ─── 情绪评估（副API，fire & forget）───
 
@@ -323,7 +324,8 @@ export async function evaluateEmotionBackground(
     userProfile: UserProfile,
     mainSystemPrompt: string,
     apiMessages: Array<{ role: string; content: any }>,
-    api: { baseUrl: string; apiKey: string; model: string; stream?: boolean }
+    api: { baseUrl: string; apiKey: string; model: string; stream?: boolean },
+    promptControl?: PromptControlSnapshot,
 ): Promise<string | null> {
     // 全局横幅「xx 正在感受…」（ChatBroadcast）。这里是所有本地评估路径的汇聚点
     // （主链路 fire & forget / post-push 补跑 / OSContext 主动消息），在函数级
@@ -347,7 +349,7 @@ export async function evaluateEmotionBackground(
             // injection+innerState 很长, 会被截断成半截 JSON → buff 静默丢失.
             max_tokens: 8000,
         };
-        const evalMeta = { appName: '消息', charId: charData.id, charName: charData.name, purpose: '情绪评估' };
+        const evalMeta = { appName: '消息', charId: charData.id, charName: charData.name, purpose: '情绪评估', promptControl };
         let data: any;
         try {
             data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -601,7 +603,7 @@ export const useChatAI = ({
 
                 setEmotionStatus('evaluating');
                 const innerState = await evaluateEmotionBackground(
-                    evalChar, deps.userProfile, payload.systemPrompt, payload.cleanedApiMessages, emotionApi,
+                    evalChar, deps.userProfile, payload.systemPrompt, payload.cleanedApiMessages, emotionApi, payload.promptControl,
                 );
                 if (innerState) setEvolvedNarrative(innerState);
                 // 成功后清 pending. 失败不清 → 下次 mount drain 重试.
@@ -832,6 +834,12 @@ export const useChatAI = ({
                 console.log(`☕ [Luckin-MiniApp] 注入协同点单上下文 step=${luckinMiniSnap?.step} cartItems=${luckinMiniSnap?.cart?.length || 0} menuItems=${luckinMiniSnap?.menuItems ? Object.keys(luckinMiniSnap.menuItems).length : 0}`);
             }
             const bilingualActive = payload.flags.bilingualActive;
+            const apiLogMeta = {
+                appName: '消息',
+                charId: char.id,
+                charName: char.name,
+                promptControl: payload.promptControl,
+            };
 
             // Debug: Log context composition
             const systemPromptLength = systemPrompt.length;
@@ -865,7 +873,7 @@ export const useChatAI = ({
             // instant 模式不受影响：worker 端本来就是主回复跑完才跑评估（天然串行）。
             const fireLocalEmotionEval = (emotionEvalEnabled && !instantOn && emotionApi) ? () => {
                 setEmotionStatus('evaluating');
-                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi)
+                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi, payload.promptControl)
                     .then((innerState) => {
                         if (innerState) setEvolvedNarrative(innerState);
                     })
@@ -1158,7 +1166,7 @@ export const useChatAI = ({
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                     method: 'POST', headers,
                     body: JSON.stringify(baseReqBody)
-                }, 2, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: '聊天回复' }, streamHooks);
+                }, 2, 0, { ...apiLogMeta, purpose: '聊天回复' }, streamHooks);
             } catch (e) {
                 // 仅通用 MCP、且没有和其他工具模式混用时降级。部分 OpenAI 兼容中转
                 // 会对携带 tools 的请求直接回 4xx，而不是忽略参数；去掉 tools 后让
@@ -1171,7 +1179,7 @@ export const useChatAI = ({
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                     method: 'POST', headers,
                     body: JSON.stringify(fallbackBody)
-                }, 0, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP tools 兼容重试' });
+                }, 0, 0, { ...apiLogMeta, purpose: 'MCP tools 兼容重试' });
             }
             console.log(`⏱ [API call] ${Math.round(performance.now() - apiT0)}ms`);
             updateTokenUsage(data, historyMsgCount, 'initial');
@@ -1304,7 +1312,7 @@ export const useChatAI = ({
                     data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    });
+                    }, 0, 0, { ...apiLogMeta, purpose: '麦当劳推荐补充' });
                     updateTokenUsage(data, historyMsgCount, `mcd-propose-${it + 1}`);
                     // 第二轮跳过 (我们已经禁用了 tools)
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
@@ -1407,7 +1415,7 @@ export const useChatAI = ({
                     data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    });
+                    }, 0, 0, { ...apiLogMeta, purpose: '瑞幸推荐补充' });
                     updateTokenUsage(data, historyMsgCount, `luckin-propose-${it + 1}`);
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
                 }
@@ -1518,7 +1526,7 @@ export const useChatAI = ({
                     data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    });
+                    }, 0, 0, { ...apiLogMeta, purpose: payload.flags.luckinChatActive ? '瑞幸点单工具循环' : 'MCP 工具循环' });
                     updateTokenUsage(data, historyMsgCount, `${payload.flags.luckinChatActive ? 'luckin-chat' : 'mcp-chat'}-${it + 1}`);
                 }
                 if (mcpToolResolve) setSearchStatus('');
@@ -1563,7 +1571,7 @@ export const useChatAI = ({
                     data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    });
+                    }, 0, 0, { ...apiLogMeta, purpose: 'MCP 文字兼容循环' });
                     updateTokenUsage(data, historyMsgCount, `mcp-text-${it + 1}`);
                 }
                 setSearchStatus('');

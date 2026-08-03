@@ -24,6 +24,26 @@ export const AMSG_TOOL_PACK_KEY = 'tool_pack';
 export const AMSG_GLOBAL_NAMESPACE = 'amsg:global';
 export const AMSG_TOOL_CONFIG_KEY = 'tool_config';
 
+export interface AmsgToolPromptControls {
+  mcpTools: boolean;
+  realtimeState: boolean;
+  timeAwareness: boolean;
+}
+
+export const DEFAULT_AMSG_TOOL_PROMPT_CONTROLS: AmsgToolPromptControls = {
+  mcpTools: true,
+  realtimeState: true,
+  timeAwareness: true,
+};
+
+export const normalizeAmsgToolPromptControls = (
+  value: Partial<AmsgToolPromptControls> | null | undefined,
+): AmsgToolPromptControls => ({
+  mcpTools: value?.mcpTools !== false,
+  realtimeState: value?.realtimeState !== false,
+  timeAwareness: value?.timeAwareness !== false,
+});
+
 /** recall / 日记 / XHS 门控要用的角色侧数据（CharacterProfile 的极小子集）。 */
 export interface AmsgToolPack {
   v: 1;
@@ -74,6 +94,8 @@ export interface AmsgToolConfig extends AgenticToolRealtimeConfig {
   mcpServers?: McpFireServer[];
   /** 前台「兼容模式」同款开关：false = 中转拒 tools，worker 退到正文协议。缺省按 true。 */
   mcpUseNativeTools?: boolean;
+  /** Prompt 控制在后台 fire 链路里的最小开关集。缺省全开，兼容旧数据。 */
+  promptControls?: AmsgToolPromptControls;
 }
 
 /**
@@ -102,20 +124,26 @@ export const isWorkerReachableUrl = (url: string): boolean => {
   } catch { return false; }
 };
 
-export const buildToolPack = (char: CharacterProfile): AmsgToolPack => ({
-  v: 1,
-  charName: char.name,
-  xhsEnabled: !!char.xhsEnabled,
-  activeMemoryMonths: char.activeMemoryMonths || [],
-  // id 等工具用不到的字段不上云；runRecall 只读 date / mood / summary。
-  memories: (char.memories || []).map((mem) => ({
-    date: mem.date,
-    summary: mem.summary,
-    ...(mem.mood ? { mood: mem.mood } : {}),
-  })),
-  // 前台的判定是「没显式关就算开」，这边照抄同一句，别让同一个开关两处读出不同结果。
-  timeAwarenessEnabled: char.timeAwarenessEnabled !== false,
-});
+export const buildToolPack = (
+  char: CharacterProfile,
+  promptControls?: Partial<AmsgToolPromptControls>,
+): AmsgToolPack => {
+  const controls = normalizeAmsgToolPromptControls(promptControls);
+  return {
+    v: 1,
+    charName: char.name,
+    xhsEnabled: !!char.xhsEnabled,
+    activeMemoryMonths: char.activeMemoryMonths || [],
+    // id 等工具用不到的字段不上云；runRecall 只读 date / mood / summary。
+    memories: (char.memories || []).map((mem) => ({
+      date: mem.date,
+      summary: mem.summary,
+      ...(mem.mood ? { mood: mem.mood } : {}),
+    })),
+    // 前台的判定是「没显式关就算开」，这边照抄同一句，别让同一个开关两处读出不同结果。
+    timeAwarenessEnabled: controls.timeAwareness && char.timeAwarenessEnabled !== false,
+  };
+};
 
 /**
  * mcp 参数由浏览器侧调用方现读现传（本模块是环境无关叶子，不能自己碰 localStorage）。
@@ -124,12 +152,15 @@ export const buildToolPack = (char: CharacterProfile): AmsgToolPack => ({
 export const buildToolConfig = (
   realtimeConfig: RealtimeConfig | undefined,
   mcp?: { servers: McpFireServer[]; useNativeTools: boolean },
+  promptControls?: Partial<AmsgToolPromptControls>,
 ): AmsgToolConfig => {
   const rc = realtimeConfig;
   const xhs = rc?.xhsMcpConfig;
+  const controls = normalizeAmsgToolPromptControls(promptControls);
   return {
     v: 1,
     proxyWorkerUrl: getProxyWorkerUrl(),
+    promptControls: controls,
     weatherEnabled: !!rc?.weatherEnabled,
     ...(rc?.weatherCity ? { weatherCity: rc.weatherCity } : {}),
     ...(rc?.weatherApiKey ? { weatherApiKey: rc.weatherApiKey } : {}),
@@ -213,6 +244,7 @@ export const parseToolConfig = (value: string): AmsgToolConfig | null => {
       delete parsed.mcpServers;
       delete parsed.mcpUseNativeTools;
     }
+    parsed.promptControls = normalizeAmsgToolPromptControls(parsed.promptControls);
     return parsed as AmsgToolConfig;
   } catch {
     return null;

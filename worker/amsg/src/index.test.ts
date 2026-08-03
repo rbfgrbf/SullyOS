@@ -18,6 +18,7 @@ import {
   AMSG_LAST_SKIP_KEY,
   AMSG_SELF_LOG_KEY,
   AMSG_SLOT_CURRENT_TIME,
+  AMSG_SLOT_REALTIME_WORLD,
   AMSG_SLOT_SELF_LOG,
   AMSG_SLOT_TASK_INSTRUCTION,
   amsgStateNamespace,
@@ -31,6 +32,7 @@ import { AMSG_TOOL_CONFIG_KEY, AMSG_TOOL_PACK_KEY } from '../../../utils/amsgToo
 import { buildMcpNameMap, MCP_FIRE_NAME_BUDGET, type McpFireServer } from '../../../utils/mcpFireCore';
 import { MAX_FIRE_SCHEDULES } from '../../../utils/amsgFireSchedule';
 import { MAX_ACTIVE_TASKS_PER_CHAR } from '../../../utils/amsg2Tasks';
+import { AMSG_WEATHER_SNAPSHOT_KEY } from './realtimeWorld';
 
 const CHAR_ID = 'preset-nyah';
 const TASK_UUID = '3637dae1-1461-4444-a747-34e406f67acc';
@@ -428,6 +430,65 @@ describe('onBeforeFire 注入通用 MCP', () => {
     expect(result).not.toHaveProperty('tools');
     expect(result.messages[0].content).not.toContain('【外部工具');
     expect((scratch.fire as any).mcpResolve).toBeNull();
+  });
+
+  it('Prompt 控制关闭 MCP → 即使 tool_config 里还有服务器，也不注入工具块或 tools', async () => {
+    const { ctx, scratch } = makeCtx({
+      globalRows: [{
+        key: AMSG_TOOL_CONFIG_KEY,
+        value: mcpToolConfigValue({
+          promptControls: { mcpTools: false, realtimeState: true, timeAwareness: true },
+        }),
+      }],
+    });
+    const result = fired(await amsgHooks.onBeforeFire(ctx));
+
+    expect(result).not.toHaveProperty('tools');
+    expect(result.messages[0].content).not.toContain('【外部工具');
+    expect(result.messages[0].content).not.toContain('search_memory');
+    expect((scratch.fire as any).mcpResolve).toBeNull();
+  });
+
+  it('Prompt 控制关闭实时状态 → 即使有天气快照，也不把实时世界补进 prompt', async () => {
+    const { ctx } = makeCtx({
+      charRows: [
+        {
+          key: AMSG_FIRE_PACK_KEY,
+          value: firePackValue(null, {
+            template: `任务前${AMSG_SLOT_REALTIME_WORLD}\n${AMSG_SLOT_TASK_INSTRUCTION}`,
+          }),
+        },
+        { key: AMSG_TOOL_PACK_KEY, value: toolPackValue },
+      ],
+      globalRows: [
+        {
+          key: AMSG_TOOL_CONFIG_KEY,
+          value: JSON.stringify({
+            v: 1,
+            proxyWorkerUrl: '',
+            weatherEnabled: true,
+            weatherCity: '上海',
+            newsEnabled: false,
+            notionEnabled: false,
+            feishuEnabled: false,
+            promptControls: { mcpTools: true, realtimeState: false, timeAwareness: true },
+          }),
+        },
+        {
+          key: AMSG_WEATHER_SNAPSHOT_KEY,
+          value: JSON.stringify({
+            city: '上海',
+            data: { temp: 26, feelsLike: 28, humidity: 66, description: '多云', icon: '03d', city: '上海' },
+            fetchedAt: NOW.getTime(),
+          }),
+        },
+      ],
+    });
+    const result = fired(await amsgHooks.onBeforeFire(ctx));
+
+    expect(result.messages[0].content).toContain('问问对方吃了没');
+    expect(result.messages[0].content).not.toContain('实时天气');
+    expect(result.messages[0].content).not.toContain('真实世界感知系统');
   });
 
   it('服务器只对别的角色可见 → 当作没配（凭据不该串到不相干的角色身上）', async () => {
