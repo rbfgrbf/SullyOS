@@ -158,6 +158,81 @@ const fired = (result: unknown): FiredResult => {
   return result as FiredResult;
 };
 
+const makePromptAuditDb = (initialRows: any[] = []) => {
+  const auditRows = [...initialRows];
+  const exec = async (sql: string, values: unknown[] = []) => {
+    if (sql.includes('INSERT INTO prompt_audit_log')) {
+      const [
+        id, createdAt, expiresAt, charId, charName, taskUuid, taskRowId, clientTaskId,
+        occurrenceMs, status, model, prompt, promptControlsJson, promptModulesJson,
+        roundsJson, usageJson, outputText, error,
+      ] = values;
+      const row = {
+        id, created_at: createdAt, expires_at: expiresAt, char_id: charId,
+        char_name: charName, task_uuid: taskUuid, task_row_id: taskRowId,
+        client_task_id: clientTaskId, occurrence_ms: occurrenceMs, status, model,
+        prompt, prompt_controls_json: promptControlsJson, prompt_modules_json: promptModulesJson,
+        rounds_json: roundsJson, usage_json: usageJson, output_text: outputText, error,
+      };
+      const idx = auditRows.findIndex((r) => r.id === id);
+      if (idx >= 0) auditRows[idx] = row;
+      else auditRows.push(row);
+      return { success: true, meta: { changes: 1 } };
+    }
+    if (sql.includes('DELETE FROM prompt_audit_log WHERE expires_at <=')) {
+      const before = auditRows.length;
+      const cutoff = Number(values[0] ?? 0);
+      for (let i = auditRows.length - 1; i >= 0; i -= 1) {
+        if (Number(auditRows[i].expires_at ?? 0) <= cutoff) auditRows.splice(i, 1);
+      }
+      return { success: true, meta: { changes: before - auditRows.length } };
+    }
+    if (sql.includes('DELETE FROM prompt_audit_log')) {
+      const before = auditRows.length;
+      auditRows.splice(0);
+      return { success: true, meta: { changes: before } };
+    }
+    return { success: true, meta: { changes: 0 } };
+  };
+  const queryAll = async (sql: string, values: unknown[] = []) => {
+    if (sql.includes('FROM prompt_audit_log')) {
+      const limit = Number(values[0] ?? 20);
+      return { results: [...auditRows].sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, limit) };
+    }
+    if (sql.includes('sqlite_master')) {
+      return {
+        results: [
+          { name: 'scheduled_messages', sql: 'CREATE TABLE scheduled_messages (id, lease_until, retry_after, serialize_group)' },
+          { name: 'client_state', sql: 'CREATE TABLE client_state (id)' },
+          { name: 'push_subscriptions', sql: 'CREATE TABLE push_subscriptions (id)' },
+          { name: 'prompt_audit_log', sql: 'CREATE TABLE prompt_audit_log (id)' },
+        ],
+      };
+    }
+    return { results: [] };
+  };
+  const queryFirst = async (sql: string) => {
+    if (sql.includes('push_subscriptions')) return { n: 1 };
+    if (sql.includes('scheduled_messages')) return { pending: 0, overdue: 0, oldest: null };
+    return null;
+  };
+  return {
+    auditRows,
+    prepare(sql: string) {
+      return {
+        bind: (...values: unknown[]) => ({
+          run: () => exec(sql, values),
+          all: () => queryAll(sql, values),
+          first: () => queryFirst(sql),
+        }),
+        run: () => exec(sql),
+        all: () => queryAll(sql),
+        first: () => queryFirst(sql),
+      };
+    },
+  };
+};
+
 describe('onBeforeFire 四道门', () => {
   it('正常路径：填好槽返回 prompt，并把工具状态挂上 scratch', async () => {
     const { ctx, scratch } = makeCtx({});
@@ -1264,6 +1339,64 @@ describe('self_log — 角色自述回写', () => {
       await amsgFireSettled({ sentCount: 1, scratch: a.scratch, writeState: storeA.writeState });
       expect(storeA.selfLog()?.entries.map((e) => e.text)).toEqual(['A 的话']);
     });
+
+    it('云端 prompt 审计：onFireSettled 把本轮完整 prompt 和模块开关写进 D1', async () => {
+      const store = makeStore(slottedFirePack());
+      const { scratch } = await runFire(store, {
+        sendAt: '2026-07-25T12:00:00.000Z',
+        llmOutput: '我来啦',
+        skipAfterSend: true,
+      });
+      const db = makePromptAuditDb();
+
+      await amsgFireSettled({
+        status: 'sent',
+        sentCount: 1,
+        total: 1,
+        scratch,
+        writeState: store.writeState,
+        env: { DB: db },
+      } as any);
+
+      expect(db.auditRows).toHaveLength(1);
+      const row = db.auditRows[0];
+      expect(row.prompt).toContain('想到什么说什么');
+      expect(row.prompt).toContain('【最近对话上下文】');
+      expect(row.output_text).toBe('我来啦');
+      expect(row.char_id).toBe(CHAR_ID);
+      expect(row.task_uuid).toBe(TASK_UUID);
+      expect(row.expires_at - row.created_at).toBe(5 * 24 * 60 * 60 * 1000);
+      expect(JSON.parse(row.prompt_controls_json)).toEqual(expect.any(Object));
+      expect(JSON.parse(row.prompt_modules_json).map((m: any) => m.key)).toContain('timeAwareness');
+    });
+
+    it('云端 prompt 审计：worker config 回调会把 env.DB 补进 onFireSettled', async () => {
+      const db = makePromptAuditDb();
+      const cfg = buildWorkerConfig({
+        AMSG_MASTER_KEY: 'k'.repeat(64),
+        VAPID_EMAIL: 'mailto:a@b.c',
+        VAPID_PUBLIC_KEY: 'pub',
+        VAPID_PRIVATE_KEY: 'priv',
+        DB: db,
+      } as any);
+      const store = makeStore(slottedFirePack());
+      const { scratch } = await runFire(store, {
+        sendAt: '2026-07-25T12:00:00.000Z',
+        llmOutput: '我来啦',
+        skipAfterSend: true,
+      });
+
+      await cfg.onFireSettled({
+        status: 'sent',
+        sentCount: 1,
+        total: 1,
+        scratch,
+        writeState: store.writeState,
+      } as any);
+
+      expect(db.auditRows).toHaveLength(1);
+      expect(db.auditRows[0].prompt).toContain('想到什么说什么');
+    });
   });
 });
 
@@ -1680,7 +1813,7 @@ describe('worker 配置接线', () => {
       VAPID_PRIVATE_KEY: 'priv',
       DB: {},
     } as any);
-    expect(cfg.onFireSettled).toBe(amsgFireSettled);
+    expect(typeof cfg.onFireSettled).toBe('function');
     expect(cfg.onStaleSkip).toBe(amsgStaleSkip);
 
     // 同角色的多条任务不并发跑，靠这个分组键。取不到 charId 时返回 null（= 不分组），
@@ -1809,6 +1942,88 @@ describe('worker 入口 — 配置不全时的响应', () => {
   });
 });
 
+describe('/prompt-audit — 云端 Prompt 审计接口', () => {
+  const envWith = (db: unknown) => ({
+    AMSG_MASTER_KEY: 'a'.repeat(64),
+    VAPID_EMAIL: 'mailto:a@b.c',
+    VAPID_PUBLIC_KEY: 'pub-key',
+    VAPID_PRIVATE_KEY: 'priv-key',
+    AMSG_SERVER_TOKEN: 'shared-secret',
+    DB: db,
+  } as any);
+  const authed = { headers: { 'X-Client-Token': 'shared-secret' } };
+
+  it('必须带共享密钥读取，不能把完整 prompt 公开到无鉴权端点', async () => {
+    const db = makePromptAuditDb();
+    const response = await (worker as any).fetch(new Request('https://w.example/prompt-audit'), envWith(db));
+    expect(response.status).toBe(401);
+    const body = await response.json();
+    expect(body.error.code).toBe('INVALID_CLIENT_TOKEN');
+  });
+
+  it('GET 返回最近审计，并在读取前清理超过 5 天的记录', async () => {
+    const db = makePromptAuditDb([
+      {
+        id: 'fresh',
+        created_at: Date.now(),
+        expires_at: Date.now() + 60_000,
+        char_id: CHAR_ID,
+        char_name: 'Nyah',
+        task_uuid: TASK_UUID,
+        task_row_id: '42',
+        client_task_id: 'client-task-1',
+        occurrence_ms: Date.parse('2026-07-25T12:00:00.000Z'),
+        status: 'sent',
+        model: 'deepseek-v4-flash',
+        prompt: '完整 prompt',
+        prompt_controls_json: JSON.stringify({ timeAwareness: true }),
+        prompt_modules_json: JSON.stringify([{ key: 'timeAwareness', enabled: true, included: true }]),
+        rounds_json: JSON.stringify([{ iteration: 0, decision: 'finish' }]),
+        usage_json: JSON.stringify({ totalTokens: 7, promptTokens: 5, completionTokens: 2 }),
+        output_text: '发出去的话',
+        error: null,
+      },
+      {
+        id: 'expired',
+        created_at: Date.now() - 10 * 24 * 60 * 60 * 1000,
+        expires_at: Date.now() - 1_000,
+        char_id: CHAR_ID,
+        prompt: '过期 prompt',
+        prompt_controls_json: '{}',
+        prompt_modules_json: '[]',
+        rounds_json: '[]',
+        usage_json: '{}',
+        output_text: '',
+        status: 'sent',
+      },
+    ]);
+
+    const response = await (worker as any).fetch(new Request('https://w.example/prompt-audit?limit=5', authed), envWith(db));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data.entries).toHaveLength(1);
+    expect(body.data.entries[0]).toMatchObject({
+      id: 'fresh',
+      charId: CHAR_ID,
+      prompt: '完整 prompt',
+      outputText: '发出去的话',
+    });
+    expect(JSON.stringify(body)).not.toContain('过期 prompt');
+    expect(db.auditRows.map((r) => r.id)).toEqual(['fresh']);
+  });
+
+  it('DELETE 清空审计记录', async () => {
+    const db = makePromptAuditDb([
+      { id: 'a', created_at: 1, expires_at: Date.now() + 1, prompt: 'p', prompt_controls_json: '{}', prompt_modules_json: '[]', rounds_json: '[]', usage_json: '{}', output_text: '', status: 'sent' },
+    ]);
+    const response = await (worker as any).fetch(new Request('https://w.example/prompt-audit', { ...authed, method: 'DELETE' }), envWith(db));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data.deleted).toBe(1);
+    expect(db.auditRows).toHaveLength(0);
+  });
+});
+
 // /debug 是隔着屏幕帮别人看部署时用的：对方只会截图或者把 JSON 贴过来，所以它既要
 // 说得足够多（配置、schema、cron），又不能带出任何一样不该外传的东西——它不设防。
 describe('/debug — 只读诊断', () => {
@@ -1838,7 +2053,7 @@ describe('/debug — 只读诊断', () => {
   });
 
   const FULL_TASK_SQL = 'CREATE TABLE scheduled_messages (id, lease_until, retry_after, serialize_group)';
-  const ALL_TABLES = ['scheduled_messages', 'client_state', 'push_subscriptions'];
+  const ALL_TABLES = ['scheduled_messages', 'client_state', 'push_subscriptions', 'prompt_audit_log'];
 
   const envWith = (db: unknown) => ({
     AMSG_MASTER_KEY: 'a'.repeat(64),

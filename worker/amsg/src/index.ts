@@ -278,10 +278,84 @@ interface FireStash {
    * 它读到的那首歌，onLLMOutput 把它冻进 directive 带给客户端（见 agentic.attachSceneSong）。
    */
   sceneSong: { id?: number; name: string; artists: string } | null;
+  /** 本次 fire 的云端 prompt 审计。完整 prompt 在 onBeforeFire 生成，结局在 onFireSettled 补齐落库。 */
+  promptAudit: AmsgPromptAuditDraft | null;
+}
+
+interface AmsgPromptAuditModule {
+  key: string;
+  label: string;
+  enabled: boolean;
+  included: boolean;
+  note?: string;
+}
+
+interface AmsgPromptAuditRound {
+  iteration: number;
+  decision: string;
+  model: string | null;
+  usage: {
+    totalTokens: number | null;
+    promptTokens: number | null;
+    completionTokens: number | null;
+  };
+  toolCalls: string[];
+  outputText: string;
+}
+
+interface AmsgPromptAuditDraft {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  charId: string;
+  charName: string;
+  taskUuid: string | null;
+  taskRowId: string | null;
+  clientTaskId: string;
+  occurrenceMs: number;
+  status: string;
+  prompt: string;
+  promptControls: Record<string, unknown>;
+  promptModules: AmsgPromptAuditModule[];
+  rounds: AmsgPromptAuditRound[];
+  outputText: string;
+  error: string | null;
 }
 
 const getFireStash = (scratch: Record<string, unknown> | undefined): FireStash | undefined =>
   scratch?.fire as FireStash | undefined;
+
+const PROMPT_AUDIT_TABLE = 'prompt_audit_log';
+const PROMPT_AUDIT_RETENTION_MS = 5 * 24 * 60 * 60 * 1000;
+const PROMPT_AUDIT_MAX_LIMIT = 50;
+const PROMPT_AUDIT_DEFAULT_LIMIT = 20;
+
+type D1RunResult = { success?: boolean; meta?: { changes?: number } };
+type D1BoundStatement = {
+  run?(): Promise<D1RunResult>;
+  first<T = unknown>(): Promise<T | null>;
+  all<T = unknown>(): Promise<{ results?: T[] }>;
+};
+type D1Statement = D1BoundStatement & {
+  bind(...values: unknown[]): D1BoundStatement;
+};
+type D1Like = {
+  prepare(sql: string): D1Statement;
+};
+
+const getD1 = (env: Pick<Env, 'DB'>): D1Like => {
+  const db = env.DB as D1Like | undefined;
+  if (typeof db?.prepare !== 'function') {
+    throw new Error('AMSG2_PROMPT_AUDIT_DB_MISSING');
+  }
+  return db;
+};
+
+const runD1 = async (statement: D1BoundStatement): Promise<D1RunResult> => {
+  if (typeof statement.run === 'function') return statement.run();
+  await statement.first();
+  return { success: true, meta: { changes: 0 } };
+};
 
 /** 两个时间戳取较新的那个；两个都没有为 null。 */
 const laterOf = (a: number | null, b: number | null): number | null =>
@@ -327,6 +401,294 @@ const buildToolCtx = (
     proxyWorkerUrl: config.proxyWorkerUrl ?? null,
     xhsCookie: config.xhsMcpConfig?.cookie ?? '',
   };
+};
+
+const toFiniteNumber = (value: unknown): number | null => (
+  typeof value === 'number' && Number.isFinite(value) ? value : null
+);
+
+const readLlmModel = (llmResponse: unknown): string | null => {
+  const model = (llmResponse as { model?: unknown })?.model;
+  return typeof model === 'string' && model.trim() ? model.trim() : null;
+};
+
+const readLlmUsage = (llmResponse: unknown) => {
+  const usage = (llmResponse as { usage?: Record<string, unknown> })?.usage ?? {};
+  return {
+    totalTokens: toFiniteNumber(usage.total_tokens ?? usage.totalTokens),
+    promptTokens: toFiniteNumber(usage.prompt_tokens ?? usage.promptTokens),
+    completionTokens: toFiniteNumber(usage.completion_tokens ?? usage.completionTokens),
+  };
+};
+
+const buildPromptAuditModules = (promptControls: AmsgToolConfig['promptControls'], runtime: {
+  mcpEnabled: boolean;
+  realtimeStateEnabled: boolean;
+  timeAwarenessEnabled: boolean;
+}) => {
+  const controls = promptControls && typeof promptControls === 'object' ? promptControls : {};
+  return Object.entries(controls).map(([key, value]) => {
+    const enabled = value !== false;
+    const included = key === 'mcpTools'
+      ? runtime.mcpEnabled
+      : key === 'realtimeState'
+        ? runtime.realtimeStateEnabled
+        : key === 'timeAwareness'
+          ? runtime.timeAwarenessEnabled
+          : enabled;
+    return {
+      key,
+      label: key,
+      enabled,
+      included,
+      note: included ? undefined : '已关闭',
+    };
+  });
+};
+
+const createPromptAuditDraft = (ctx: FireCtx, prompt: string, promptControls: AmsgToolConfig['promptControls'], runtime: {
+  mcpEnabled: boolean;
+  realtimeStateEnabled: boolean;
+  timeAwarenessEnabled: boolean;
+  mcpNative: boolean;
+  canSelfSchedule: boolean;
+}) => {
+  const createdAt = Date.now();
+  const taskUuid = typeof ctx.task.uuid === 'string' ? ctx.task.uuid : null;
+  const taskRowId = ctx.task.id != null ? String(ctx.task.id) : null;
+  const clientTaskId = typeof ctx.task.metadata?.amsgClientTaskId === 'string'
+    ? ctx.task.metadata.amsgClientTaskId
+    : '';
+  return {
+    id: `${ctx.task.metadata?.charId || 'char'}:${taskUuid || taskRowId || 'task'}:${ctx.task.nextSendAt || ctx.now.getTime()}`,
+    createdAt,
+    expiresAt: createdAt + PROMPT_AUDIT_RETENTION_MS,
+    charId: typeof ctx.task.metadata?.charId === 'string' ? ctx.task.metadata.charId : 'unknown',
+    charName: typeof ctx.task.contactName === 'string' && ctx.task.contactName.trim() ? ctx.task.contactName.trim() : 'unknown',
+    taskUuid,
+    taskRowId,
+    clientTaskId,
+    occurrenceMs: ctx.now.getTime(),
+    status: 'pending',
+    prompt,
+    promptControls: { ...(promptControls || {}) },
+    promptModules: buildPromptAuditModules(promptControls, runtime),
+    rounds: [],
+    outputText: '',
+    error: null,
+  } satisfies AmsgPromptAuditDraft;
+};
+
+const appendPromptAuditRound = (
+  draft: AmsgPromptAuditDraft,
+  ctx: SessionCtx,
+  outputText: string,
+  decision: { decision: string; toolCalls?: Array<{ function?: { name?: string } }> },
+) => {
+  draft.rounds.push({
+    iteration: typeof ctx.iteration === 'number' ? ctx.iteration : draft.rounds.length,
+    decision: decision.decision,
+    model: readLlmModel(ctx.llmResponse),
+    usage: readLlmUsage(ctx.llmResponse),
+    toolCalls: (decision.toolCalls ?? []).map((tool) => typeof tool?.function?.name === 'string' ? tool.function.name : '').filter(Boolean),
+    outputText,
+  });
+  draft.outputText = outputText;
+};
+
+const sumPromptAuditUsage = (rounds: AmsgPromptAuditRound[]) => {
+  const sum = (key: keyof AmsgPromptAuditRound['usage']) => {
+    let total = 0;
+    let seen = false;
+    for (const round of rounds) {
+      const value = round.usage[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        total += value;
+        seen = true;
+      }
+    }
+    return seen ? total : null;
+  };
+  return {
+    totalTokens: sum('totalTokens'),
+    promptTokens: sum('promptTokens'),
+    completionTokens: sum('completionTokens'),
+  };
+};
+
+const parseAuditJson = <T,>(value: unknown, fallback: T): T => {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+export const ensurePromptAuditSchema = async (env: Pick<Env, 'DB'>): Promise<void> => {
+  const db = getD1(env);
+  await runD1(db.prepare(`
+    CREATE TABLE IF NOT EXISTS ${PROMPT_AUDIT_TABLE} (
+      id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      char_id TEXT,
+      char_name TEXT,
+      task_uuid TEXT,
+      task_row_id TEXT,
+      client_task_id TEXT,
+      occurrence_ms INTEGER,
+      status TEXT NOT NULL,
+      model TEXT,
+      prompt TEXT NOT NULL,
+      prompt_controls_json TEXT NOT NULL,
+      prompt_modules_json TEXT NOT NULL,
+      rounds_json TEXT NOT NULL,
+      usage_json TEXT NOT NULL,
+      output_text TEXT NOT NULL,
+      error TEXT
+    )
+  `));
+  await runD1(db.prepare(`CREATE INDEX IF NOT EXISTS idx_prompt_audit_expires ON ${PROMPT_AUDIT_TABLE} (expires_at)`));
+  await runD1(db.prepare(`CREATE INDEX IF NOT EXISTS idx_prompt_audit_created ON ${PROMPT_AUDIT_TABLE} (created_at DESC)`));
+};
+
+const deleteExpiredPromptAudits = async (
+  env: Pick<Env, 'DB'>,
+  cutoff = Date.now(),
+): Promise<number> => {
+  await ensurePromptAuditSchema(env);
+  const result = await runD1(
+    getD1(env)
+      .prepare(`DELETE FROM ${PROMPT_AUDIT_TABLE} WHERE expires_at <= ?`)
+      .bind(cutoff),
+  );
+  return Number(result.meta?.changes ?? 0);
+};
+
+export const recordPromptAudit = async (
+  env: Pick<Env, 'DB'>,
+  entry: AmsgPromptAuditDraft,
+): Promise<void> => {
+  await ensurePromptAuditSchema(env);
+  await deleteExpiredPromptAudits(env);
+  const model = [...entry.rounds].reverse().find((round) => round.model)?.model ?? null;
+  await runD1(
+    getD1(env)
+      .prepare(`
+        INSERT INTO ${PROMPT_AUDIT_TABLE} (
+          id, created_at, expires_at, char_id, char_name, task_uuid, task_row_id,
+          client_task_id, occurrence_ms, status, model, prompt, prompt_controls_json,
+          prompt_modules_json, rounds_json, usage_json, output_text, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          created_at = excluded.created_at,
+          expires_at = excluded.expires_at,
+          char_id = excluded.char_id,
+          char_name = excluded.char_name,
+          task_uuid = excluded.task_uuid,
+          task_row_id = excluded.task_row_id,
+          client_task_id = excluded.client_task_id,
+          occurrence_ms = excluded.occurrence_ms,
+          status = excluded.status,
+          model = excluded.model,
+          prompt = excluded.prompt,
+          prompt_controls_json = excluded.prompt_controls_json,
+          prompt_modules_json = excluded.prompt_modules_json,
+          rounds_json = excluded.rounds_json,
+          usage_json = excluded.usage_json,
+          output_text = excluded.output_text,
+          error = excluded.error
+      `)
+      .bind(
+        entry.id,
+        entry.createdAt,
+        entry.expiresAt,
+        entry.charId,
+        entry.charName,
+        entry.taskUuid,
+        entry.taskRowId,
+        entry.clientTaskId,
+        entry.occurrenceMs,
+        entry.status,
+        model,
+        entry.prompt,
+        JSON.stringify(entry.promptControls),
+        JSON.stringify(entry.promptModules),
+        JSON.stringify(entry.rounds),
+        JSON.stringify(sumPromptAuditUsage(entry.rounds)),
+        entry.outputText,
+        entry.error,
+      ),
+  );
+};
+
+type PromptAuditRow = {
+  id?: unknown;
+  created_at?: unknown;
+  expires_at?: unknown;
+  char_id?: unknown;
+  char_name?: unknown;
+  task_uuid?: unknown;
+  task_row_id?: unknown;
+  client_task_id?: unknown;
+  occurrence_ms?: unknown;
+  status?: unknown;
+  model?: unknown;
+  prompt?: unknown;
+  prompt_controls_json?: unknown;
+  prompt_modules_json?: unknown;
+  rounds_json?: unknown;
+  usage_json?: unknown;
+  output_text?: unknown;
+  error?: unknown;
+};
+
+const auditRowToEntry = (row: PromptAuditRow) => ({
+  id: typeof row.id === 'string' ? row.id : String(row.id ?? ''),
+  createdAt: Number(row.created_at ?? 0),
+  expiresAt: Number(row.expires_at ?? 0),
+  charId: typeof row.char_id === 'string' ? row.char_id : null,
+  charName: typeof row.char_name === 'string' ? row.char_name : null,
+  taskUuid: typeof row.task_uuid === 'string' ? row.task_uuid : null,
+  taskRowId: typeof row.task_row_id === 'string' ? row.task_row_id : null,
+  clientTaskId: typeof row.client_task_id === 'string' ? row.client_task_id : null,
+  occurrenceMs: typeof row.occurrence_ms === 'number' ? row.occurrence_ms : Number(row.occurrence_ms ?? 0) || null,
+  status: typeof row.status === 'string' ? row.status : 'unknown',
+  model: typeof row.model === 'string' && row.model ? row.model : null,
+  prompt: typeof row.prompt === 'string' ? row.prompt : '',
+  promptControls: parseAuditJson<Record<string, unknown>>(row.prompt_controls_json, {}),
+  promptModules: parseAuditJson<AmsgPromptAuditModule[]>(row.prompt_modules_json, []),
+  rounds: parseAuditJson<AmsgPromptAuditRound[]>(row.rounds_json, []),
+  usage: parseAuditJson<Record<string, unknown>>(row.usage_json, {}),
+  outputText: typeof row.output_text === 'string' ? row.output_text : '',
+  error: typeof row.error === 'string' ? row.error : null,
+});
+
+export const listPromptAudit = async (
+  env: Pick<Env, 'DB'>,
+  limit = PROMPT_AUDIT_DEFAULT_LIMIT,
+) => {
+  const safeLimit = Math.max(1, Math.min(PROMPT_AUDIT_MAX_LIMIT, Math.floor(limit) || PROMPT_AUDIT_DEFAULT_LIMIT));
+  await deleteExpiredPromptAudits(env);
+  const rows = await getD1(env)
+    .prepare(`
+      SELECT id, created_at, expires_at, char_id, char_name, task_uuid, task_row_id,
+             client_task_id, occurrence_ms, status, model, prompt, prompt_controls_json,
+             prompt_modules_json, rounds_json, usage_json, output_text, error
+        FROM ${PROMPT_AUDIT_TABLE}
+       ORDER BY created_at DESC
+       LIMIT ?
+    `)
+    .bind(safeLimit)
+    .all<PromptAuditRow>();
+  return (rows.results ?? []).map(auditRowToEntry);
+};
+
+export const clearPromptAudit = async (env: Pick<Env, 'DB'>): Promise<{ deleted: number }> => {
+  await ensurePromptAuditSchema(env);
+  const result = await runD1(getD1(env).prepare(`DELETE FROM ${PROMPT_AUDIT_TABLE}`));
+  return { deleted: Number(result.meta?.changes ?? 0) };
 };
 
 /**
@@ -469,6 +831,7 @@ export const amsgFireSettled = async (
     sentCount?: number;
     scratch: Record<string, unknown>;
     writeState: WriteState;
+    env?: Pick<Env, 'DB'>;
   },
 ): Promise<void> => {
   const stash = getFireStash(info.scratch);
@@ -477,6 +840,28 @@ export const amsgFireSettled = async (
   const texts = stash.selfLogTexts;
   stash.selfLogTexts = null;   // 认领掉，重复调用不会记两遍
   const sentCount = info.sentCount ?? 0;
+  const audit = stash.promptAudit;
+  if (audit) {
+    audit.status = info.status || (sentCount > 0 ? 'sent' : 'settled');
+    const deliveredText = texts
+      ?.slice(0, sentCount)
+      .filter((message) => message.trim())
+      .join('\n')
+      .trim();
+    if (deliveredText) audit.outputText = deliveredText;
+  }
+  if (audit) {
+    stash.promptAudit = null;
+    if (!info.env) {
+      console.warn('[amsg:prompt-audit] missing env, audit not recorded');
+    } else {
+      try {
+        await recordPromptAudit(info.env, audit);
+      } catch (error) {
+        console.warn('[amsg:prompt-audit] write failed', error);
+      }
+    }
+  }
   if (texts && sentCount > 0) {
     // 多段消息在用户那边是连着的几条气泡，对角色而言是一次「我说了这些」，合成一条记。
     // 只取前 sentCount 段：部分失败时没送出去的正文绝不能进日志。
@@ -967,6 +1352,7 @@ export const amsgHooks = {
       // 跟下面 renderFirePack 填「你此刻在听」用的是同一个时刻、同一份 scene、同一个种子
       // （resolveFireSceneSong 与 renderFireSceneBlock 共用判定），冻的必然是正文里那首。
       sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz),
+      promptAudit: null,
     } satisfies FireStash;
 
     // 「你还挂着这些排程」：客户端记录的（打包那一刻的快照）+ 角色自己在之前几次 fire 里
@@ -1012,6 +1398,16 @@ export const amsgHooks = {
         ? [buildFireScheduleTool({ nowMs: ctx.now.getTime(), tz })]
         : []),
     ];
+    const stash = getFireStash(ctx.scratch);
+    if (stash) {
+      stash.promptAudit = createPromptAuditDraft(ctx, prompt, promptControls, {
+        mcpEnabled,
+        realtimeStateEnabled,
+        timeAwarenessEnabled,
+        mcpNative,
+        canSelfSchedule,
+      });
+    }
     return {
       messages: [{ role: 'user' as const, content: prompt }],
       // 轮次上限显式给一份：worker 要靠同一个数判「这是最后一轮了」（见 onLLMOutput），
@@ -1099,6 +1495,19 @@ export const amsgHooks = {
     typeof ctx.scheduleTask === 'function' ? { nativeToolCalls: nativeScheduleCalls } : null,
     // 最后一轮不再放行工具请求，改成用手上的内容收尾（见 agentic.ts 的 MAX_TOOL_ITERATIONS）。
     ctx.iteration);
+
+    if (stash.promptAudit) {
+      appendPromptAuditRound(stash.promptAudit, ctx, content, decision);
+      stash.promptAudit.status = decision.decision;
+      if (decision.decision === 'finish') {
+        const generatedText = decision.pushPayloads
+          .map((payload) => (typeof payload.message === 'string' ? payload.message : ''))
+          .filter((message) => message.trim())
+          .join('\n')
+          .trim();
+        if (generatedText) stash.promptAudit.outputText = generatedText;
+      }
+    }
 
     if (decision.decision === 'tool-request') {
       console.log('[amsg:agentic]', {
@@ -1260,6 +1669,8 @@ export const buildWorkerConfig = (env: Env) => {
     publicKey: env.VAPID_PUBLIC_KEY,
     privateKey: env.VAPID_PRIVATE_KEY,
   };
+  const onFireSettled = (info: Parameters<typeof amsgFireSettled>[0]) =>
+    amsgFireSettled({ ...info, env: { DB: env.DB } });
   return {
     // db 缺省时 factory 自动用 createD1Adapter(env.DB)
     masterKey: env.AMSG_MASTER_KEY,
@@ -1277,7 +1688,7 @@ export const buildWorkerConfig = (env: Env) => {
     //   在这里统一落盘（见 amsgFireSettled）。不用 onAfterSend——它只在真发出去那条路
     //   触发，角色自排任务碰上「只做了副作用没说话」就会漏账变成幽灵任务。
     // onStaleSkip: 过期不补发时给面板留一句「为什么没响」（见 amsgStaleSkip）。
-    onFireSettled: amsgFireSettled,
+    onFireSettled,
     onStaleSkip: amsgStaleSkip,
     // 同一个角色的多条任务不并发跑：两条撞在一起时用户会收到两条互不知情的消息，
     // 而且 self_log 是读-改-写整份，后写的会盖掉先写的那条「我说过什么」。分组键取
@@ -1379,10 +1790,71 @@ const jsonWithCors = (status: number, body: unknown): Response =>
   });
 
 // cron 触发时 CF 传进来的事件，只往上游转手，没必要为它引 workers-types。
+const requirePromptAuditAuth = (request: Request, env: Env): Response | null => {
+  const expected = env.AMSG_SERVER_TOKEN?.trim();
+  if (!expected) {
+    return jsonWithCors(403, {
+      success: false,
+      error: {
+        code: 'PROMPT_AUDIT_TOKEN_REQUIRED',
+        message: 'Prompt audit requires AMSG_SERVER_TOKEN before full prompts can be viewed.',
+      },
+    });
+  }
+  const actual = request.headers.get('X-Client-Token')?.trim();
+  if (actual !== expected) {
+    return jsonWithCors(401, {
+      success: false,
+      error: { code: 'INVALID_CLIENT_TOKEN', message: 'X-Client-Token is missing or invalid.' },
+    });
+  }
+  return null;
+};
+
+const handlePromptAuditRequest = async (
+  request: Request,
+  env: Env,
+  method: string,
+): Promise<Response> => {
+  if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+  const authError = requirePromptAuditAuth(request, env);
+  if (authError) return authError;
+
+  const report = inspectWorkerEnv(env);
+  if (!report.ok) {
+    return jsonWithCors(503, {
+      success: false,
+      error: { code: 'WORKER_CONFIG_MISSING', message: report.message, missing: report.missing },
+    });
+  }
+
+  if (method === 'GET') {
+    const url = new URL(request.url);
+    const limit = Number(url.searchParams.get('limit') ?? PROMPT_AUDIT_DEFAULT_LIMIT);
+    return jsonWithCors(200, {
+      success: true,
+      data: {
+        entries: await listPromptAudit(env, limit),
+        retentionDays: PROMPT_AUDIT_RETENTION_MS / 86400000,
+      },
+    });
+  }
+
+  if (method === 'DELETE') {
+    return jsonWithCors(200, { success: true, data: await clearPromptAudit(env) });
+  }
+
+  return jsonWithCors(405, {
+    success: false,
+    error: { code: 'METHOD_NOT_ALLOWED', message: 'Use GET or DELETE for prompt audit.' },
+  });
+};
+
 type CfScheduledEvent = { scheduledTime: number; cron: string };
 
 /** 上游 initSchema 建的表。少一张就说明「连接并验证」那步没跑成。 */
-const EXPECTED_TABLES = ['scheduled_messages', 'client_state', 'push_subscriptions'];
+const EXPECTED_TABLES = ['scheduled_messages', 'client_state', 'push_subscriptions', PROMPT_AUDIT_TABLE];
 
 /**
  * 上游后加的列（amsg-server 2.6.0 的三个迁移）。
@@ -1395,14 +1867,6 @@ const EXPECTED_TASK_COLUMNS = ['lease_until', 'retry_after', 'serialize_group'];
 
 /** 到点多久还没被处理就算 cron 那侧出了问题。cron 每分钟一跳，留足重试余量。 */
 const TICK_STALL_MINUTES = 5;
-
-type D1Like = {
-  prepare(sql: string): {
-    bind(...values: unknown[]): { first<T = unknown>(): Promise<T | null> };
-    first<T = unknown>(): Promise<T | null>;
-    all<T = unknown>(): Promise<{ results?: T[] }>;
-  };
-};
 
 /**
  * 只读地看一眼库里的状况：表齐不齐、列全不全、有没有到点却没人处理的任务。
@@ -1545,6 +2009,10 @@ export default {
       });
     }
 
+    if (pathname.endsWith('/prompt-audit')) {
+      return handlePromptAuditRequest(request, env, method);
+    }
+
     const report = inspectWorkerEnv(env);
     if (!report.ok) {
       // 预检也得放行：带自定义头的请求会先发 OPTIONS，这一步被挡住的话正式请求
@@ -1554,6 +2022,22 @@ export default {
         success: false,
         error: { code: 'WORKER_CONFIG_MISSING', message: report.message, missing: report.missing },
       });
+    }
+
+    if (pathname.endsWith('/init-tenant') && method === 'POST') {
+      const response = await upstream.fetch(request, env);
+      if (response.status >= 200 && response.status < 300) {
+        try {
+          await ensurePromptAuditSchema(env);
+        } catch (error) {
+          console.warn('[amsg:prompt-audit] schema init failed', error);
+          return jsonWithCors(500, {
+            success: false,
+            error: { code: 'PROMPT_AUDIT_SCHEMA_FAILED', message: 'Prompt audit table init failed.' },
+          });
+        }
+      }
+      return response;
     }
 
     return upstream.fetch(request, env);

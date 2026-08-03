@@ -174,6 +174,61 @@ describe('ActiveMsgClient.cancelTask', () => {
   });
 });
 
+describe('ActiveMsgClient prompt audit client', () => {
+  /** safeResponseJson 读 status、text() 和 headers（content-type），假 Response 三样都要有。 */
+  const respondWith = (status: number, body: unknown) => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status,
+      text: async () => JSON.stringify(body),
+      headers: new Headers({ 'content-type': 'application/json' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('读取云端 prompt 审计时走 /prompt-audit 并带共享密钥', async () => {
+    const fetchMock = respondWith(200, {
+      success: true,
+      data: {
+        entries: [{
+          id: 'audit-1',
+          createdAt: 1,
+          expiresAt: 2,
+          charId: 'char-1',
+          charName: 'Sully',
+          status: 'sent',
+          prompt: '完整 prompt',
+          promptControls: {},
+          promptModules: [],
+          rounds: [],
+          usage: {},
+          outputText: '你好',
+        }],
+      },
+    });
+
+    const entries = await ActiveMsgClient.listPromptAudits(5);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].prompt).toBe('完整 prompt');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe('https://amsg.example.workers.dev/prompt-audit?limit=5');
+    expect(new Headers(init.headers).get('X-User-Id')).toBe(TEST_USER_ID);
+  });
+
+  it('清空云端 prompt 审计时走 DELETE /prompt-audit', async () => {
+    const fetchMock = respondWith(200, { success: true, data: { deleted: 3 } });
+
+    await expect(ActiveMsgClient.clearPromptAudits()).resolves.toEqual({ deleted: 3 });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe('https://amsg.example.workers.dev/prompt-audit');
+    expect(init.method).toBe('DELETE');
+  });
+});
+
 // 回归守卫：连接失败的归类。使用统计只发这个代号，不发报错原文——
 // 「密钥对不上」「地址不对」「D1 没绑」在图上混成一格的话，看不出该修哪一段引导；
 // 而把 error.message 塞进上报又会带出 Worker 地址。两头都得钉住。

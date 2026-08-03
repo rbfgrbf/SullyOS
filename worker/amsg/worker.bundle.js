@@ -8341,6 +8341,22 @@ function buildScheduledPush(message, build, extraMeta, bannerBody) {
 
 // worker/amsg/src/index.ts
 var getFireStash = (scratch) => scratch?.fire;
+var PROMPT_AUDIT_TABLE = "prompt_audit_log";
+var PROMPT_AUDIT_RETENTION_MS = 5 * 24 * 60 * 60 * 1e3;
+var PROMPT_AUDIT_MAX_LIMIT = 50;
+var PROMPT_AUDIT_DEFAULT_LIMIT = 20;
+var getD1 = (env) => {
+  const db = env.DB;
+  if (typeof db?.prepare !== "function") {
+    throw new Error("AMSG2_PROMPT_AUDIT_DB_MISSING");
+  }
+  return db;
+};
+var runD1 = async (statement) => {
+  if (typeof statement.run === "function") return statement.run();
+  await statement.first();
+  return { success: true, meta: { changes: 0 } };
+};
 var laterOf = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
 var buildToolCtx = (pack, config) => {
   const char = {
@@ -8369,6 +8385,218 @@ var buildToolCtx = (pack, config) => {
     proxyWorkerUrl: config.proxyWorkerUrl ?? null,
     xhsCookie: config.xhsMcpConfig?.cookie ?? ""
   };
+};
+var toFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+var readLlmModel = (llmResponse) => {
+  const model = llmResponse?.model;
+  return typeof model === "string" && model.trim() ? model.trim() : null;
+};
+var readLlmUsage = (llmResponse) => {
+  const usage = llmResponse?.usage ?? {};
+  return {
+    totalTokens: toFiniteNumber(usage.total_tokens ?? usage.totalTokens),
+    promptTokens: toFiniteNumber(usage.prompt_tokens ?? usage.promptTokens),
+    completionTokens: toFiniteNumber(usage.completion_tokens ?? usage.completionTokens)
+  };
+};
+var buildPromptAuditModules = (promptControls, runtime) => {
+  const controls = promptControls && typeof promptControls === "object" ? promptControls : {};
+  return Object.entries(controls).map(([key, value]) => {
+    const enabled = value !== false;
+    const included = key === "mcpTools" ? runtime.mcpEnabled : key === "realtimeState" ? runtime.realtimeStateEnabled : key === "timeAwareness" ? runtime.timeAwarenessEnabled : enabled;
+    return {
+      key,
+      label: key,
+      enabled,
+      included,
+      note: included ? void 0 : "\u5DF2\u5173\u95ED"
+    };
+  });
+};
+var createPromptAuditDraft = (ctx, prompt, promptControls, runtime) => {
+  const createdAt = Date.now();
+  const taskUuid = typeof ctx.task.uuid === "string" ? ctx.task.uuid : null;
+  const taskRowId = ctx.task.id != null ? String(ctx.task.id) : null;
+  const clientTaskId = typeof ctx.task.metadata?.amsgClientTaskId === "string" ? ctx.task.metadata.amsgClientTaskId : "";
+  return {
+    id: `${ctx.task.metadata?.charId || "char"}:${taskUuid || taskRowId || "task"}:${ctx.task.nextSendAt || ctx.now.getTime()}`,
+    createdAt,
+    expiresAt: createdAt + PROMPT_AUDIT_RETENTION_MS,
+    charId: typeof ctx.task.metadata?.charId === "string" ? ctx.task.metadata.charId : "unknown",
+    charName: typeof ctx.task.contactName === "string" && ctx.task.contactName.trim() ? ctx.task.contactName.trim() : "unknown",
+    taskUuid,
+    taskRowId,
+    clientTaskId,
+    occurrenceMs: ctx.now.getTime(),
+    status: "pending",
+    prompt,
+    promptControls: { ...promptControls || {} },
+    promptModules: buildPromptAuditModules(promptControls, runtime),
+    rounds: [],
+    outputText: "",
+    error: null
+  };
+};
+var appendPromptAuditRound = (draft, ctx, outputText, decision) => {
+  draft.rounds.push({
+    iteration: typeof ctx.iteration === "number" ? ctx.iteration : draft.rounds.length,
+    decision: decision.decision,
+    model: readLlmModel(ctx.llmResponse),
+    usage: readLlmUsage(ctx.llmResponse),
+    toolCalls: (decision.toolCalls ?? []).map((tool) => typeof tool?.function?.name === "string" ? tool.function.name : "").filter(Boolean),
+    outputText
+  });
+  draft.outputText = outputText;
+};
+var sumPromptAuditUsage = (rounds) => {
+  const sum = (key) => {
+    let total = 0;
+    let seen = false;
+    for (const round of rounds) {
+      const value = round.usage[key];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        total += value;
+        seen = true;
+      }
+    }
+    return seen ? total : null;
+  };
+  return {
+    totalTokens: sum("totalTokens"),
+    promptTokens: sum("promptTokens"),
+    completionTokens: sum("completionTokens")
+  };
+};
+var parseAuditJson = (value, fallback) => {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+var ensurePromptAuditSchema = async (env) => {
+  const db = getD1(env);
+  await runD1(db.prepare(`
+    CREATE TABLE IF NOT EXISTS ${PROMPT_AUDIT_TABLE} (
+      id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      char_id TEXT,
+      char_name TEXT,
+      task_uuid TEXT,
+      task_row_id TEXT,
+      client_task_id TEXT,
+      occurrence_ms INTEGER,
+      status TEXT NOT NULL,
+      model TEXT,
+      prompt TEXT NOT NULL,
+      prompt_controls_json TEXT NOT NULL,
+      prompt_modules_json TEXT NOT NULL,
+      rounds_json TEXT NOT NULL,
+      usage_json TEXT NOT NULL,
+      output_text TEXT NOT NULL,
+      error TEXT
+    )
+  `));
+  await runD1(db.prepare(`CREATE INDEX IF NOT EXISTS idx_prompt_audit_expires ON ${PROMPT_AUDIT_TABLE} (expires_at)`));
+  await runD1(db.prepare(`CREATE INDEX IF NOT EXISTS idx_prompt_audit_created ON ${PROMPT_AUDIT_TABLE} (created_at DESC)`));
+};
+var deleteExpiredPromptAudits = async (env, cutoff = Date.now()) => {
+  await ensurePromptAuditSchema(env);
+  const result = await runD1(
+    getD1(env).prepare(`DELETE FROM ${PROMPT_AUDIT_TABLE} WHERE expires_at <= ?`).bind(cutoff)
+  );
+  return Number(result.meta?.changes ?? 0);
+};
+var recordPromptAudit = async (env, entry) => {
+  await ensurePromptAuditSchema(env);
+  await deleteExpiredPromptAudits(env);
+  const model = [...entry.rounds].reverse().find((round) => round.model)?.model ?? null;
+  await runD1(
+    getD1(env).prepare(`
+        INSERT INTO ${PROMPT_AUDIT_TABLE} (
+          id, created_at, expires_at, char_id, char_name, task_uuid, task_row_id,
+          client_task_id, occurrence_ms, status, model, prompt, prompt_controls_json,
+          prompt_modules_json, rounds_json, usage_json, output_text, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          created_at = excluded.created_at,
+          expires_at = excluded.expires_at,
+          char_id = excluded.char_id,
+          char_name = excluded.char_name,
+          task_uuid = excluded.task_uuid,
+          task_row_id = excluded.task_row_id,
+          client_task_id = excluded.client_task_id,
+          occurrence_ms = excluded.occurrence_ms,
+          status = excluded.status,
+          model = excluded.model,
+          prompt = excluded.prompt,
+          prompt_controls_json = excluded.prompt_controls_json,
+          prompt_modules_json = excluded.prompt_modules_json,
+          rounds_json = excluded.rounds_json,
+          usage_json = excluded.usage_json,
+          output_text = excluded.output_text,
+          error = excluded.error
+      `).bind(
+      entry.id,
+      entry.createdAt,
+      entry.expiresAt,
+      entry.charId,
+      entry.charName,
+      entry.taskUuid,
+      entry.taskRowId,
+      entry.clientTaskId,
+      entry.occurrenceMs,
+      entry.status,
+      model,
+      entry.prompt,
+      JSON.stringify(entry.promptControls),
+      JSON.stringify(entry.promptModules),
+      JSON.stringify(entry.rounds),
+      JSON.stringify(sumPromptAuditUsage(entry.rounds)),
+      entry.outputText,
+      entry.error
+    )
+  );
+};
+var auditRowToEntry = (row) => ({
+  id: typeof row.id === "string" ? row.id : String(row.id ?? ""),
+  createdAt: Number(row.created_at ?? 0),
+  expiresAt: Number(row.expires_at ?? 0),
+  charId: typeof row.char_id === "string" ? row.char_id : null,
+  charName: typeof row.char_name === "string" ? row.char_name : null,
+  taskUuid: typeof row.task_uuid === "string" ? row.task_uuid : null,
+  taskRowId: typeof row.task_row_id === "string" ? row.task_row_id : null,
+  clientTaskId: typeof row.client_task_id === "string" ? row.client_task_id : null,
+  occurrenceMs: typeof row.occurrence_ms === "number" ? row.occurrence_ms : Number(row.occurrence_ms ?? 0) || null,
+  status: typeof row.status === "string" ? row.status : "unknown",
+  model: typeof row.model === "string" && row.model ? row.model : null,
+  prompt: typeof row.prompt === "string" ? row.prompt : "",
+  promptControls: parseAuditJson(row.prompt_controls_json, {}),
+  promptModules: parseAuditJson(row.prompt_modules_json, []),
+  rounds: parseAuditJson(row.rounds_json, []),
+  usage: parseAuditJson(row.usage_json, {}),
+  outputText: typeof row.output_text === "string" ? row.output_text : "",
+  error: typeof row.error === "string" ? row.error : null
+});
+var listPromptAudit = async (env, limit = PROMPT_AUDIT_DEFAULT_LIMIT) => {
+  const safeLimit = Math.max(1, Math.min(PROMPT_AUDIT_MAX_LIMIT, Math.floor(limit) || PROMPT_AUDIT_DEFAULT_LIMIT));
+  await deleteExpiredPromptAudits(env);
+  const rows = await getD1(env).prepare(`
+      SELECT id, created_at, expires_at, char_id, char_name, task_uuid, task_row_id,
+             client_task_id, occurrence_ms, status, model, prompt, prompt_controls_json,
+             prompt_modules_json, rounds_json, usage_json, output_text, error
+        FROM ${PROMPT_AUDIT_TABLE}
+       ORDER BY created_at DESC
+       LIMIT ?
+    `).bind(safeLimit).all();
+  return (rows.results ?? []).map(auditRowToEntry);
+};
+var clearPromptAudit = async (env) => {
+  await ensurePromptAuditSchema(env);
+  const result = await runD1(getD1(env).prepare(`DELETE FROM ${PROMPT_AUDIT_TABLE}`));
+  return { deleted: Number(result.meta?.changes ?? 0) };
 };
 var fireStateError = (reason, detail) => {
   console.error("[amsg:fire-state-missing]", { reason, ...detail });
@@ -8420,6 +8648,24 @@ var amsgFireSettled = async (info) => {
   const texts = stash.selfLogTexts;
   stash.selfLogTexts = null;
   const sentCount = info.sentCount ?? 0;
+  const audit = stash.promptAudit;
+  if (audit) {
+    audit.status = info.status || (sentCount > 0 ? "sent" : "settled");
+    const deliveredText = texts?.slice(0, sentCount).filter((message) => message.trim()).join("\n").trim();
+    if (deliveredText) audit.outputText = deliveredText;
+  }
+  if (audit) {
+    stash.promptAudit = null;
+    if (!info.env) {
+      console.warn("[amsg:prompt-audit] missing env, audit not recorded");
+    } else {
+      try {
+        await recordPromptAudit(info.env, audit);
+      } catch (error) {
+        console.warn("[amsg:prompt-audit] write failed", error);
+      }
+    }
+  }
   if (texts && sentCount > 0) {
     const text = texts.slice(0, sentCount).filter((message) => message.trim()).join("\n");
     const next = appendSelfLogEntry(stash.selfLog, {
@@ -8706,7 +8952,8 @@ var amsgHooks = {
       selfLogTexts: null,
       // 跟下面 renderFirePack 填「你此刻在听」用的是同一个时刻、同一份 scene、同一个种子
       // （resolveFireSceneSong 与 renderFireSceneBlock 共用判定），冻的必然是正文里那首。
-      sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz)
+      sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz),
+      promptAudit: null
     };
     const taskListBlock = buildFireTaskListBlock(livePendingTasks, {
       nowMs: ctx.now.getTime(),
@@ -8731,6 +8978,16 @@ var amsgHooks = {
       ...mcpResolve && mcpNative ? buildMcpFireTools(mcpResolve) : [],
       ...canSelfSchedule && mcpNative ? [buildFireScheduleTool({ nowMs: ctx.now.getTime(), tz })] : []
     ];
+    const stash = getFireStash(ctx.scratch);
+    if (stash) {
+      stash.promptAudit = createPromptAuditDraft(ctx, prompt, promptControls, {
+        mcpEnabled,
+        realtimeStateEnabled,
+        timeAwarenessEnabled,
+        mcpNative,
+        canSelfSchedule
+      });
+    }
     return {
       messages: [{ role: "user", content: prompt }],
       // 轮次上限显式给一份：worker 要靠同一个数判「这是最后一轮了」（见 onLLMOutput），
@@ -8800,6 +9057,14 @@ var amsgHooks = {
       // 最后一轮不再放行工具请求，改成用手上的内容收尾（见 agentic.ts 的 MAX_TOOL_ITERATIONS）。
       ctx.iteration
     );
+    if (stash.promptAudit) {
+      appendPromptAuditRound(stash.promptAudit, ctx, content, decision);
+      stash.promptAudit.status = decision.decision;
+      if (decision.decision === "finish") {
+        const generatedText = decision.pushPayloads.map((payload) => typeof payload.message === "string" ? payload.message : "").filter((message) => message.trim()).join("\n").trim();
+        if (generatedText) stash.promptAudit.outputText = generatedText;
+      }
+    }
     if (decision.decision === "tool-request") {
       console.log("[amsg:agentic]", {
         type: "tool_request",
@@ -8905,6 +9170,7 @@ var buildWorkerConfig = (env) => {
     publicKey: env.VAPID_PUBLIC_KEY,
     privateKey: env.VAPID_PRIVATE_KEY
   };
+  const onFireSettled = (info) => amsgFireSettled({ ...info, env: { DB: env.DB } });
   return {
     // db 缺省时 factory 自动用 createD1Adapter(env.DB)
     masterKey: env.AMSG_MASTER_KEY,
@@ -8922,7 +9188,7 @@ var buildWorkerConfig = (env) => {
     //   在这里统一落盘（见 amsgFireSettled）。不用 onAfterSend——它只在真发出去那条路
     //   触发，角色自排任务碰上「只做了副作用没说话」就会漏账变成幽灵任务。
     // onStaleSkip: 过期不补发时给面板留一句「为什么没响」（见 amsgStaleSkip）。
-    onFireSettled: amsgFireSettled,
+    onFireSettled,
     onStaleSkip: amsgStaleSkip,
     // 同一个角色的多条任务不并发跑：两条撞在一起时用户会收到两条互不知情的消息，
     // 而且 self_log 是读-改-写整份，后写的会盖掉先写的那条「我说过什么」。分组键取
@@ -8984,7 +9250,57 @@ var jsonWithCors = (status, body) => new Response(JSON.stringify(body), {
   status,
   headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS }
 });
-var EXPECTED_TABLES = ["scheduled_messages", "client_state", "push_subscriptions"];
+var requirePromptAuditAuth = (request, env) => {
+  const expected = env.AMSG_SERVER_TOKEN?.trim();
+  if (!expected) {
+    return jsonWithCors(403, {
+      success: false,
+      error: {
+        code: "PROMPT_AUDIT_TOKEN_REQUIRED",
+        message: "Prompt audit requires AMSG_SERVER_TOKEN before full prompts can be viewed."
+      }
+    });
+  }
+  const actual = request.headers.get("X-Client-Token")?.trim();
+  if (actual !== expected) {
+    return jsonWithCors(401, {
+      success: false,
+      error: { code: "INVALID_CLIENT_TOKEN", message: "X-Client-Token is missing or invalid." }
+    });
+  }
+  return null;
+};
+var handlePromptAuditRequest = async (request, env, method) => {
+  if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+  const authError = requirePromptAuditAuth(request, env);
+  if (authError) return authError;
+  const report = inspectWorkerEnv(env);
+  if (!report.ok) {
+    return jsonWithCors(503, {
+      success: false,
+      error: { code: "WORKER_CONFIG_MISSING", message: report.message, missing: report.missing }
+    });
+  }
+  if (method === "GET") {
+    const url = new URL(request.url);
+    const limit = Number(url.searchParams.get("limit") ?? PROMPT_AUDIT_DEFAULT_LIMIT);
+    return jsonWithCors(200, {
+      success: true,
+      data: {
+        entries: await listPromptAudit(env, limit),
+        retentionDays: PROMPT_AUDIT_RETENTION_MS / 864e5
+      }
+    });
+  }
+  if (method === "DELETE") {
+    return jsonWithCors(200, { success: true, data: await clearPromptAudit(env) });
+  }
+  return jsonWithCors(405, {
+    success: false,
+    error: { code: "METHOD_NOT_ALLOWED", message: "Use GET or DELETE for prompt audit." }
+  });
+};
+var EXPECTED_TABLES = ["scheduled_messages", "client_state", "push_subscriptions", PROMPT_AUDIT_TABLE];
 var EXPECTED_TASK_COLUMNS = ["lease_until", "retry_after", "serialize_group"];
 var TICK_STALL_MINUTES = 5;
 var inspectStorage = async (env) => {
@@ -9069,6 +9385,9 @@ var src_default = {
         }
       });
     }
+    if (pathname.endsWith("/prompt-audit")) {
+      return handlePromptAuditRequest(request, env, method);
+    }
     const report = inspectWorkerEnv(env);
     if (!report.ok) {
       if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -9076,6 +9395,21 @@ var src_default = {
         success: false,
         error: { code: "WORKER_CONFIG_MISSING", message: report.message, missing: report.missing }
       });
+    }
+    if (pathname.endsWith("/init-tenant") && method === "POST") {
+      const response = await upstream.fetch(request, env);
+      if (response.status >= 200 && response.status < 300) {
+        try {
+          await ensurePromptAuditSchema(env);
+        } catch (error) {
+          console.warn("[amsg:prompt-audit] schema init failed", error);
+          return jsonWithCors(500, {
+            success: false,
+            error: { code: "PROMPT_AUDIT_SCHEMA_FAILED", message: "Prompt audit table init failed." }
+          });
+        }
+      }
+      return response;
     }
     return upstream.fetch(request, env);
   },
@@ -9094,9 +9428,13 @@ export {
   amsgStaleSkip,
   attachScheduledTasks,
   buildWorkerConfig,
+  clearPromptAudit,
   src_default as default,
+  ensurePromptAuditSchema,
   inspectWorkerEnv,
+  listPromptAudit,
   offloadOversizedPush,
+  recordPromptAudit,
   resolveVapidEmail,
   runFireScheduleTool,
   runMcpFireTool

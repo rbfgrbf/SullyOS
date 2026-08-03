@@ -23,6 +23,7 @@ import { InstantPushSettingsModal } from '../components/settings/InstantPushSett
 import { PushVapidSettingsModal } from '../components/settings/PushVapidSettingsModal';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
 import ActiveMsgGlobalSettingsModal from '../components/settings/ActiveMsgGlobalSettingsModal';
+import ActiveMsgPromptAuditPanel from '../components/settings/ActiveMsgPromptAuditPanel';
 import { syncAmsgToolConfig, syncAmsgToolConfigAndPrompts } from '../utils/amsgStateSync';
 import { ActiveMsgClient } from '../utils/activeMsgClient';
 import VersionInfo from '../components/settings/VersionInfo';
@@ -2631,6 +2632,8 @@ const Settings: React.FC = () => {
                 角色到点自动给你发消息，App 关着也能收。需要你自己部署一个 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里填地址即可。与上方 Instant Push（你发消息才即时回）互补。
             </p>
         </section>
+
+        <ActiveMsgPromptAuditPanel addToast={addToast} />
 
         {/* 自定义网络代理 — 刻意低调的高级入口。默认折叠，不主动指引基本发现不了。
             普通用户无需配置：默认走作者部署的公共 Worker，所有功能开箱即用。 */}

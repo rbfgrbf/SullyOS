@@ -92,6 +92,34 @@ export interface AmsgRemotePushSubscription {
   updatedAt: number | null;
 }
 
+export interface AmsgPromptAuditEntry {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  charId: string | null;
+  charName: string | null;
+  taskUuid: string | null;
+  taskRowId: string | null;
+  clientTaskId: string | null;
+  occurrenceMs: number | null;
+  status: string;
+  model: string | null;
+  prompt: string;
+  promptControls: Record<string, unknown>;
+  promptModules: Array<{ key: string; label: string; enabled: boolean; included: boolean; note?: string }>;
+  rounds: Array<{
+    iteration: number;
+    decision: string;
+    model: string | null;
+    usage: { totalTokens: number | null; promptTokens: number | null; completionTokens: number | null };
+    toolCalls: string[];
+    outputText: string;
+  }>;
+  usage: Record<string, unknown>;
+  outputText: string;
+  error: string | null;
+}
+
 /**
  * 「worker 到点会不会推到这台设备」的结论。
  *
@@ -1565,6 +1593,37 @@ export const ActiveMsgClient = {
     const globalConfig = await ensureWorkerReady();
     const client = createClient(globalConfig);
     return client.getCapabilities();
+  },
+
+  async listPromptAudits(limit = 20): Promise<AmsgPromptAuditEntry[]> {
+    const config = await ensureWorkerReady();
+    const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 20));
+    const response = await fetchWithAuth(
+      `prompt-audit?limit=${safeLimit}`,
+      config,
+      { method: 'GET' },
+      '读取云端 prompt 审计',
+    );
+    if (!response?.success) {
+      throw new Error(response?.error?.message || '读取云端 prompt 审计失败。');
+    }
+    return Array.isArray(response.data?.entries)
+      ? response.data.entries as AmsgPromptAuditEntry[]
+      : [];
+  },
+
+  async clearPromptAudits(): Promise<{ deleted: number }> {
+    const config = await ensureWorkerReady();
+    const response = await fetchWithAuth(
+      'prompt-audit',
+      config,
+      { method: 'DELETE' },
+      '清空云端 prompt 审计',
+    );
+    if (!response?.success) {
+      throw new Error(response?.error?.message || '清空云端 prompt 审计失败。');
+    }
+    return { deleted: Number(response.data?.deleted ?? 0) };
   },
 
   /**
